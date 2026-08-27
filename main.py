@@ -2,11 +2,17 @@ import asyncio
 import copy
 import json
 import random
+from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Dict
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from uuid import uuid4
+
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
+from sqlalchemy import text
+
 import uvicorn
-from database import get_session_factory
+from database import dispose_engine, get_session_factory
 from game_logic import Player, Room
 from repositories import (
     create_game,
@@ -19,7 +25,19 @@ from repositories import (
     save_runtime_room,
 )
 
-app = FastAPI(title="Dilemma Bingo Server")
+BASE_DIR = Path(__file__).resolve().parent
+INDEX_FILE = BASE_DIR / "index.html"
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    try:
+        yield
+    finally:
+        await dispose_engine()
+
+
+app = FastAPI(title="Dilemma Bingo Server", lifespan=lifespan)
 
 class ConnectionManager:
     def __init__(self):
@@ -107,6 +125,79 @@ def validate_start_game(room: Room) -> None:
         raise ValueError("최소 2명 이상 필요합니다.")
 
 
+VALID_DEAL_CHOICES = {"COOP", "BETRAY"}
+
+
+def get_pending_phase(room: Room) -> str | None:
+    if not room.deal_state:
+        return None
+    return room.deal_state.get("phase", "CHOICE")
+
+
+def validate_turn_number(room: Room, client_id: str, number: object) -> Player:
+    if room.status != "PLAYING":
+        raise ValueError("진행 중인 게임이 아닙니다.")
+    if room.deal_state is not None:
+        raise ValueError("진행 중인 거래를 먼저 완료해야 합니다.")
+    turn_player = room.get_turn_player()
+    if turn_player is None or turn_player.client_id != client_id:
+        raise ValueError("현재 차례의 참가자만 실행할 수 있습니다.")
+    if type(number) is not int or number not in turn_player.board:
+        raise ValueError("빙고판에 있는 유효한 번호를 선택하세요.")
+    if number in turn_player.marked:
+        raise ValueError("이미 마킹된 번호는 선택할 수 없습니다.")
+    return turn_player
+
+
+def validate_deal_proposal(
+    room: Room, client_id: str, target_id: object, number: object
+) -> tuple[Player, Player]:
+    turn_player = validate_turn_number(room, client_id, number)
+    if type(target_id) is not str or target_id == client_id:
+        raise ValueError("거래 대상이 유효하지 않습니다.")
+    if turn_player.last_target_id == target_id:
+        raise ValueError("직전 턴에 거래한 대상과 연속 거래할 수 없습니다.")
+    target_player = next(
+        (player for player in room.active_players if player.client_id == target_id),
+        None,
+    )
+    if target_player is None:
+        raise ValueError("거래 대상이 유효하지 않습니다.")
+    return turn_player, target_player
+
+
+def validate_deal_choice(room: Room, client_id: str, choice: object) -> dict:
+    state = room.deal_state
+    if room.status != "PLAYING" or not state or get_pending_phase(room) != "CHOICE":
+        raise ValueError("응답할 수 있는 거래가 없습니다.")
+    if client_id not in {state.get("initiator"), state.get("target")}:
+        raise ValueError("거래 당사자만 선택할 수 있습니다.")
+    if choice not in VALID_DEAL_CHOICES:
+        raise ValueError("유효하지 않은 거래 선택입니다.")
+    choices = state.get("choices")
+    if not isinstance(choices, dict):
+        raise ValueError("거래 상태가 올바르지 않습니다.")
+    if client_id in choices:
+        raise ValueError("이미 거래 선택을 완료했습니다.")
+    return state
+
+
+def validate_bonus_pick(room: Room, client_id: str, number: object) -> Player:
+    state = room.deal_state
+    if room.status != "PLAYING" or not state or get_pending_phase(room) != "BONUS":
+        raise ValueError("선택할 수 있는 보너스가 없습니다.")
+    if state.get("bonus_player") != client_id:
+        raise ValueError("보너스 권한이 있는 참가자만 선택할 수 있습니다.")
+    player = room.players.get(client_id)
+    if player is None or player.ws is None:
+        raise ValueError("보너스 참가자를 찾을 수 없습니다.")
+    if type(number) is not int or number not in player.board:
+        raise ValueError("빙고판에 있는 유효한 번호를 선택하세요.")
+    if number in player.marked:
+        raise ValueError("이미 마킹된 번호는 선택할 수 없습니다.")
+    return player
+
+
 def capture_room_state(room: Room) -> dict:
     return {
         "status": room.status,
@@ -156,7 +247,7 @@ def cancel_timer(room: Room):
 
 
 def schedule_turn_timer(room: Room) -> None:
-    if room.status != "PLAYING" or not room.active_players:
+    if room.status != "PLAYING" or not room.active_players or room.deal_state:
         room.timer_task = None
         return
     if room.timer_task and not room.timer_task.done():
@@ -164,6 +255,37 @@ def schedule_turn_timer(room: Room) -> None:
     room.timer_task = asyncio.create_task(
         timer_wrapper(10.0, handle_turn_timeout, room.room_id, room.turn_index)
     )
+
+
+def schedule_deal_timer(room: Room) -> None:
+    if get_pending_phase(room) != "CHOICE":
+        return
+    if room.timer_task and not room.timer_task.done():
+        return
+    token = room.deal_state.get("token") or uuid4().hex
+    room.deal_state["token"] = token
+    room.timer_task = asyncio.create_task(
+        timer_wrapper(10.0, handle_deal_timeout, room.room_id, token)
+    )
+
+
+def schedule_bonus_timer(room: Room) -> None:
+    if get_pending_phase(room) != "BONUS":
+        return
+    if room.timer_task and not room.timer_task.done():
+        return
+    token = room.deal_state.get("token") or uuid4().hex
+    room.deal_state["token"] = token
+    room.timer_task = asyncio.create_task(
+        timer_wrapper(10.0, handle_bonus_timeout, room.room_id, token)
+    )
+
+
+def schedule_pending_timer(room: Room) -> None:
+    if get_pending_phase(room) == "CHOICE":
+        schedule_deal_timer(room)
+    elif get_pending_phase(room) == "BONUS":
+        schedule_bonus_timer(room)
 
 async def timer_wrapper(delay: float, func, *args):
     try:
@@ -202,15 +324,73 @@ async def handle_turn_timeout(room_id: str, turn_index: int):
             await _broadcast_room_transition(room)
 
 # 타이머 핸들러: 비밀 거래 초과 -> 강제 배신
-async def handle_deal_timeout(room_id: str, deal_num: int):
-    room = manager.rooms.get(room_id)
-    if not room or room.status != "PLAYING" or not room.deal_state or room.deal_state["number"] != deal_num: return
-    if room.timer_task is asyncio.current_task():
-        room.timer_task = None
-    for cid in [room.deal_state["initiator"], room.deal_state["target"]]:
-        if cid not in room.deal_state["choices"]:
-            room.deal_state["choices"][cid] = "BETRAY" # 무응답시 배신 처리
-    await _resolve_deal(room)
+async def handle_deal_timeout(room_id: str, deal_token: str):
+    async with manager.get_room_lock(room_id):
+        room = manager.rooms.get(room_id)
+        if (
+            not room
+            or room.status != "PLAYING"
+            or get_pending_phase(room) != "CHOICE"
+            or room.deal_state.get("token") != deal_token
+        ):
+            return
+        if room.timer_task is asyncio.current_task():
+            room.timer_task = None
+        state = capture_room_state(room)
+        for client_id in (room.deal_state["initiator"], room.deal_state["target"]):
+            room.deal_state["choices"].setdefault(client_id, "BETRAY")
+        try:
+            async with get_session_factory()() as session:
+                try:
+                    resolution = await _resolve_deal(room, session)
+                    await session.commit()
+                except Exception:
+                    await session.rollback()
+                    raise
+        except Exception:
+            restore_room_state(room, state)
+            schedule_deal_timer(room)
+            return
+        await _publish_deal_resolution(room, resolution)
+
+
+async def handle_bonus_timeout(room_id: str, bonus_token: str):
+    async with manager.get_room_lock(room_id):
+        room = manager.rooms.get(room_id)
+        if (
+            not room
+            or room.status != "PLAYING"
+            or get_pending_phase(room) != "BONUS"
+            or room.deal_state.get("token") != bonus_token
+        ):
+            return
+        if room.timer_task is asyncio.current_task():
+            room.timer_task = None
+        state = capture_room_state(room)
+        bonus_player_id = room.deal_state.get("bonus_player")
+        room.deal_state = None
+        try:
+            async with get_session_factory()() as session:
+                try:
+                    await _check_winners_and_next(room, session=session, broadcast=False)
+                    await session.commit()
+                except Exception:
+                    await session.rollback()
+                    raise
+        except Exception:
+            restore_room_state(room, state)
+            schedule_bonus_timer(room)
+            return
+        bonus_player = room.players.get(bonus_player_id)
+        nickname = bonus_player.nickname if bonus_player else "보너스 참가자"
+        await manager.broadcast(
+            room_id,
+            {
+                "type": "event_log",
+                "message": f"⏳ {nickname}님이 보너스 번호를 선택하지 않아 기회를 넘겼습니다.",
+            },
+        )
+        await _broadcast_room_transition(room)
 
 # 🚨 API: 방 목록 조회 기능
 @app.get("/api/rooms")
@@ -219,9 +399,22 @@ async def get_rooms():
         active_rooms = await get_room_summaries(session)
     return {"rooms": active_rooms}
 
+
+@app.get("/health", include_in_schema=False)
+async def get_health():
+    try:
+        async with get_session_factory()() as session:
+            await session.execute(text("SELECT 1"))
+    except Exception as error:
+        raise HTTPException(
+            status_code=503,
+            detail="database unavailable",
+        ) from error
+    return {"status": "ok", "database": "ok"}
+
 @app.get("/")
 async def get_index():
-    return FileResponse("index.html")
+    return FileResponse(INDEX_FILE)
 
 @app.websocket("/ws/{room_id}/{client_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str):
@@ -273,7 +466,11 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
                     await manager.send_personal(websocket, {
                         "type": "game_started", "board": player.board, "marked": list(player.marked)
                     })
-                    await _notify_turn(room)
+                    if room.deal_state:
+                        schedule_pending_timer(room)
+                        await _restore_pending_action(room, player)
+                    else:
+                        await _notify_turn(room)
 
             elif get_current_connection_player(room, client_id, websocket) is None:
                 await manager.send_personal(
@@ -349,78 +546,156 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
 
             elif action == "public_call":
                 async with manager.get_room_lock(room_id):
-                    turn_player = room.get_turn_player()
-                    if room.status == "PLAYING" and turn_player and turn_player.client_id == client_id:
-                        state = capture_room_state(room)
-                        cancel_timer(room)
-                        number = payload.get("number")
-                        room.last_marked_num = number
-                        for p in room.active_players: p.mark_number(number)
-                        try:
-                            async with get_session_factory()() as session:
-                                try:
-                                    await _check_winners_and_next(room, session=session, broadcast=False)
-                                    await session.commit()
-                                except Exception:
-                                    await session.rollback()
-                                    raise
-                        except Exception:
-                            restore_room_state(room, state)
-                            schedule_turn_timer(room)
-                            await manager.send_personal(websocket, {"type": "error", "message": "공개 콜 저장에 실패했습니다."})
-                            continue
-                        await manager.broadcast(room_id, {"type": "event_log", "message": f"📢 [공개] {turn_player.nickname}님이 [{number}]을(를) 불렀습니다. (전원 마킹)"})
-                        await _broadcast_room_transition(room)
+                    number = payload.get("number")
+                    try:
+                        turn_player = validate_turn_number(room, client_id, number)
+                    except ValueError as error:
+                        await manager.send_personal(
+                            websocket, {"type": "error", "message": str(error)}
+                        )
+                        continue
+                    state = capture_room_state(room)
+                    cancel_timer(room)
+                    room.last_marked_num = number
+                    for player in room.active_players:
+                        player.mark_number(number)
+                    try:
+                        async with get_session_factory()() as session:
+                            try:
+                                await _check_winners_and_next(room, session=session, broadcast=False)
+                                await session.commit()
+                            except Exception:
+                                await session.rollback()
+                                raise
+                    except Exception:
+                        restore_room_state(room, state)
+                        schedule_turn_timer(room)
+                        await manager.send_personal(websocket, {"type": "error", "message": "공개 콜 저장에 실패했습니다."})
+                        continue
+                    await manager.broadcast(room_id, {"type": "event_log", "message": f"📢 [공개] {turn_player.nickname}님이 [{number}]을(를) 불렀습니다. (전원 마킹)"})
+                    await _broadcast_room_transition(room)
 
             elif action == "propose_deal":
-                turn_player = room.get_turn_player()
-                if turn_player and turn_player.client_id == client_id:
+                async with manager.get_room_lock(room_id):
                     target_id = payload.get("target_id")
                     number = payload.get("number")
-                    
-                    if turn_player.last_target_id == target_id:
-                        await manager.send_personal(websocket, {"type": "error", "message": "직전 턴에 거래한 대상과 연속 거래 불가!"})
+                    try:
+                        turn_player, target_player = validate_deal_proposal(
+                            room, client_id, target_id, number
+                        )
+                    except ValueError as error:
+                        await manager.send_personal(
+                            websocket, {"type": "error", "message": str(error)}
+                        )
                         continue
-
-                    target_player = next(
-                        (
-                            player
-                            for player in room.active_players
-                            if player.client_id == target_id and player.client_id != client_id
-                        ),
-                        None,
-                    )
-                    if not target_player:
-                        await manager.send_personal(websocket, {"type": "error", "message": "거래 대상이 유효하지 않습니다."})
-                        continue
-
+                    state = capture_room_state(room)
                     cancel_timer(room)
                     turn_player.last_target_id = target_id
-                    room.deal_state = {"initiator": client_id, "target": target_id, "number": number, "choices": {}}
-                    
+                    room.deal_state = {
+                        "phase": "CHOICE",
+                        "token": uuid4().hex,
+                        "initiator": client_id,
+                        "target": target_id,
+                        "number": number,
+                        "choices": {},
+                    }
+                    try:
+                        async with get_session_factory()() as session:
+                            try:
+                                await save_runtime_room(session, room)
+                                await session.commit()
+                            except Exception:
+                                await session.rollback()
+                                raise
+                    except Exception:
+                        restore_room_state(room, state)
+                        schedule_turn_timer(room)
+                        await manager.send_personal(
+                            websocket,
+                            {"type": "error", "message": "거래 상태 저장에 실패했습니다."},
+                        )
+                        continue
                     await manager.send_personal(turn_player.ws, {"type": "open_deal", "number": number, "partner_name": target_player.nickname})
                     await manager.send_personal(target_player.ws, {"type": "open_deal", "number": number, "partner_name": turn_player.nickname})
                     await manager.broadcast(room_id, {"type": "event_log", "message": f"🤫 [비밀 거래] {turn_player.nickname}님이 {target_player.nickname}님을 지목했습니다!"})
-                    
-                    # 🚨 거래 타이머 시작
-                    room.timer_task = asyncio.create_task(timer_wrapper(10.0, handle_deal_timeout, room.room_id, number))
+                    schedule_deal_timer(room)
 
             elif action == "deal_choice":
-                if not room.deal_state: continue
-                room.deal_state["choices"][client_id] = payload.get("choice") 
-                if len(room.deal_state["choices"]) == 2:
-                    cancel_timer(room)
-                    await _resolve_deal(room)
+                async with manager.get_room_lock(room_id):
+                    choice = payload.get("choice")
+                    try:
+                        deal_state = validate_deal_choice(room, client_id, choice)
+                    except ValueError as error:
+                        await manager.send_personal(
+                            websocket, {"type": "error", "message": str(error)}
+                        )
+                        continue
+                    state = capture_room_state(room)
+                    deal_state["choices"] = {
+                        **deal_state["choices"],
+                        client_id: choice,
+                    }
+                    resolution = None
+                    deal_complete = len(deal_state["choices"]) == 2
+                    if deal_complete:
+                        cancel_timer(room)
+                    try:
+                        async with get_session_factory()() as session:
+                            try:
+                                if deal_complete:
+                                    resolution = await _resolve_deal(room, session)
+                                else:
+                                    await save_runtime_room(session, room)
+                                await session.commit()
+                            except Exception:
+                                await session.rollback()
+                                raise
+                    except Exception:
+                        restore_room_state(room, state)
+                        schedule_deal_timer(room)
+                        await manager.send_personal(
+                            websocket,
+                            {"type": "error", "message": "거래 선택 저장에 실패했습니다."},
+                        )
+                        continue
+                    if resolution is not None:
+                        await _publish_deal_resolution(room, resolution)
 
             elif action == "bonus_pick":
-                cancel_timer(room)
-                number = payload.get("number")
-                player = room.players.get(client_id)
-                if player:
+                async with manager.get_room_lock(room_id):
+                    number = payload.get("number")
+                    try:
+                        player = validate_bonus_pick(room, client_id, number)
+                    except ValueError as error:
+                        await manager.send_personal(
+                            websocket, {"type": "error", "message": str(error)}
+                        )
+                        continue
+                    state = capture_room_state(room)
+                    cancel_timer(room)
                     player.mark_number(number)
                     room.last_marked_num = number
+                    room.deal_state = None
+                    try:
+                        async with get_session_factory()() as session:
+                            try:
+                                await _check_winners_and_next(
+                                    room, session=session, broadcast=False
+                                )
+                                await session.commit()
+                            except Exception:
+                                await session.rollback()
+                                raise
+                    except Exception:
+                        restore_room_state(room, state)
+                        schedule_bonus_timer(room)
+                        await manager.send_personal(
+                            websocket,
+                            {"type": "error", "message": "보너스 상태 저장에 실패했습니다."},
+                        )
+                        continue
                     await manager.broadcast(room_id, {"type": "event_log", "message": f"🎯 [보너스] {player.nickname}님이 보너스 칸 마킹 완료!"})
-                    await _check_winners_and_next(room)
+                    await _broadcast_room_transition(room)
 
     except WebSocketDisconnect:
         if client_id in room.players:
@@ -476,6 +751,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
                 turn_index_changed = room.turn_index != previous_turn_index
                 if was_turn or turn_index_changed or not room.active_players:
                     cancel_timer(room)
+                schedule_pending_timer(room)
             if len(room.players) == 0:
                 manager.rooms.pop(room_id, None)
             else:
@@ -489,44 +765,105 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
                 elif room.active_players and turn_index_changed:
                     await _notify_turn(room)
 
-async def _resolve_deal(room: Room):
-    initiator_id = room.deal_state["initiator"]
-    target_id = room.deal_state["target"]
-    number = room.deal_state["number"]
-    choices = room.deal_state["choices"]
-    
+async def _resolve_deal(room: Room, session):
+    deal_state = room.deal_state
+    initiator_id = deal_state["initiator"]
+    target_id = deal_state["target"]
+    number = deal_state["number"]
+    choices = deal_state["choices"]
+
     p_init = room.players.get(initiator_id)
     p_target = room.players.get(target_id)
     if not p_init or not p_target:
         room.deal_state = None
-        await _check_winners_and_next(room)
-        return
+        await _check_winners_and_next(room, session=session, broadcast=False)
+        return {
+            "message": "거래 참가자의 연결이 종료되어 거래를 취소했습니다.",
+            "bonus_player": None,
+        }
 
     c_init = choices.get(initiator_id, "BETRAY")
     c_target = choices.get(target_id, "BETRAY")
-    room.last_marked_num = number 
+    room.last_marked_num = number
 
     if c_init == "COOP" and c_target == "COOP":
         p_init.mark_number(number)
         p_target.mark_number(number)
-        await manager.broadcast(room.room_id, {"type": "event_log", "message": f"🤝 [상호 협동] 서로를 믿고 [{number}] 마킹 성공!"})
         room.deal_state = None
-        await _check_winners_and_next(room)
+        await _check_winners_and_next(room, session=session, broadcast=False)
+        return {
+            "message": f"🤝 [상호 협동] 서로를 믿고 [{number}] 마킹 성공!",
+            "bonus_player": None,
+        }
     elif c_init == "BETRAY" and c_target == "BETRAY":
-        for p in room.active_players:
-            if p.client_id not in [initiator_id, target_id]: p.mark_number(number)
-        await manager.broadcast(room.room_id, {"type": "event_log", "message": f"💥 [상호 배신 파멸!] 기회는 날아가고, 나머지 전원에게 [{number}] 공짜 마킹!"})
+        for player in room.active_players:
+            if player.client_id not in [initiator_id, target_id]:
+                player.mark_number(number)
         room.deal_state = None
-        await _check_winners_and_next(room)
+        await _check_winners_and_next(room, session=session, broadcast=False)
+        return {
+            "message": f"💥 [상호 배신 파멸!] 기회는 날아가고, 나머지 전원에게 [{number}] 공짜 마킹!",
+            "bonus_player": None,
+        }
     else:
         betrayer = p_init if c_init == "BETRAY" else p_target
-        victim = p_target if c_init == "BETRAY" else p_init
         betrayer.mark_number(number)
-        await manager.broadcast(room.room_id, {"type": "event_log", "message": f"🗡️ [배신 성공] {betrayer.nickname}님이 통수를 치고 독식했습니다!"})
-        room.deal_state = None
-        await manager.send_personal(betrayer.ws, {"type": "require_bonus"})
-        # 보너스 픽도 10초 타이머 (무응답시 패스)
-        schedule_turn_timer(room)
+        room.deal_state = {
+            "phase": "BONUS",
+            "token": uuid4().hex,
+            "initiator": initiator_id,
+            "target": target_id,
+            "number": number,
+            "choices": choices,
+            "bonus_player": betrayer.client_id,
+        }
+        await save_runtime_room(session, room)
+        return {
+            "message": f"🗡️ [배신 성공] {betrayer.nickname}님이 통수를 치고 독식했습니다!",
+            "bonus_player": betrayer.client_id,
+        }
+
+
+async def _publish_deal_resolution(room: Room, resolution: dict) -> None:
+    await manager.broadcast(
+        room.room_id,
+        {"type": "event_log", "message": resolution["message"]},
+    )
+    bonus_player_id = resolution.get("bonus_player")
+    if bonus_player_id:
+        bonus_player = room.players.get(bonus_player_id)
+        if bonus_player and bonus_player.ws is not None:
+            await manager.send_personal(bonus_player.ws, {"type": "require_bonus"})
+        schedule_bonus_timer(room)
+    else:
+        await _broadcast_room_transition(room)
+
+
+async def _restore_pending_action(room: Room, player: Player) -> None:
+    state = room.deal_state
+    if not state:
+        return
+    phase = get_pending_phase(room)
+    if phase == "CHOICE" and player.client_id in {
+        state.get("initiator"),
+        state.get("target"),
+    }:
+        partner_id = (
+            state.get("target")
+            if player.client_id == state.get("initiator")
+            else state.get("initiator")
+        )
+        partner = room.players.get(partner_id)
+        await manager.send_personal(
+            player.ws,
+            {
+                "type": "open_deal",
+                "number": state.get("number"),
+                "partner_name": partner.nickname if partner else "연결 대기 중",
+            },
+        )
+    elif phase == "BONUS" and state.get("bonus_player") == player.client_id:
+        await manager.send_personal(player.ws, {"type": "require_bonus"})
 
 async def _check_winners_and_next(
     room: Room,

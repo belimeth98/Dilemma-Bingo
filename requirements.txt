@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 SQLAlchemy>=2.0
 asyncmy
+cryptography
 alembic
 pydantic-settings
 pytest

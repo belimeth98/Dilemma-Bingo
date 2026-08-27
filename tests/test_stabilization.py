@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -44,6 +45,9 @@ class FakeSession:
 
     async def rollback(self):
         pass
+
+    async def execute(self, statement):
+        return statement
 
 
 class FakeFactory:
@@ -96,6 +100,58 @@ class EndpointWebSocket:
 
 def make_player(client_id="client-1", ws=object()):
     return Player(client_id, client_id, ws, board=list(range(1, 50)))
+
+
+@pytest.mark.asyncio
+async def test_health_checks_database_connection(monkeypatch):
+    session = FakeSession()
+    monkeypatch.setattr(main, "get_session_factory", lambda: FakeFactory(session))
+
+    response = await main.get_health()
+
+    assert response == {"status": "ok", "database": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_health_hides_database_errors(monkeypatch):
+    class FailingSession(FakeSession):
+        async def execute(self, statement):
+            raise RuntimeError("connection contains a secret")
+
+    monkeypatch.setattr(
+        main,
+        "get_session_factory",
+        lambda: FakeFactory(FailingSession()),
+    )
+
+    with pytest.raises(main.HTTPException) as error:
+        await main.get_health()
+
+    assert error.value.status_code == 503
+    assert error.value.detail == "database unavailable"
+
+
+@pytest.mark.asyncio
+async def test_lifespan_disposes_database_pool(monkeypatch):
+    disposed = []
+
+    async def dispose():
+        disposed.append(True)
+
+    monkeypatch.setattr(main, "dispose_engine", dispose)
+
+    async with main.lifespan(main.app):
+        assert disposed == []
+
+    assert disposed == [True]
+
+
+@pytest.mark.asyncio
+async def test_index_uses_project_absolute_path():
+    response = await main.get_index()
+
+    assert Path(response.path) == main.INDEX_FILE
+    assert main.INDEX_FILE.is_absolute()
 
 
 @pytest.mark.asyncio
@@ -531,4 +587,199 @@ async def test_disconnect_state_is_saved_without_stopping_game(monkeypatch):
     assert room.status == "PLAYING"
     assert room.current_game_id == 1
     assert player.board == list(range(1, 50))
+    main.manager.rooms.pop(room.room_id, None)
+
+
+def make_playing_room(room_id="room-actions"):
+    room = Room(room_id)
+    room.status = "PLAYING"
+    room.current_game_id = 1
+    initiator = make_player("initiator")
+    target = make_player("target")
+    room.add_player(initiator)
+    room.add_player(target)
+    return room, initiator, target
+
+
+def test_deal_proposal_validates_turn_number_and_target():
+    room, initiator, target = make_playing_room()
+
+    current, partner = main.validate_deal_proposal(
+        room, initiator.client_id, target.client_id, 1
+    )
+
+    assert current is initiator
+    assert partner is target
+
+    initiator.mark_number(1)
+    with pytest.raises(ValueError, match="이미 마킹된 번호"):
+        main.validate_deal_proposal(room, initiator.client_id, target.client_id, 1)
+
+    with pytest.raises(ValueError, match="현재 차례"):
+        main.validate_deal_proposal(room, target.client_id, initiator.client_id, 2)
+
+
+def test_deal_choice_rejects_outsider_invalid_and_duplicate_choices():
+    room, initiator, target = make_playing_room()
+    outsider = make_player("outsider")
+    room.add_player(outsider)
+    room.deal_state = {
+        "phase": "CHOICE",
+        "token": "deal-token",
+        "initiator": initiator.client_id,
+        "target": target.client_id,
+        "number": 1,
+        "choices": {},
+    }
+
+    with pytest.raises(ValueError, match="거래 당사자"):
+        main.validate_deal_choice(room, outsider.client_id, "COOP")
+
+    with pytest.raises(ValueError, match="유효하지 않은 거래 선택"):
+        main.validate_deal_choice(room, initiator.client_id, "INVALID")
+
+    room.deal_state["choices"][initiator.client_id] = "COOP"
+    with pytest.raises(ValueError, match="이미 거래 선택"):
+        main.validate_deal_choice(room, initiator.client_id, "BETRAY")
+
+
+def test_bonus_pick_requires_pending_betrayer_and_unmarked_number():
+    room, initiator, target = make_playing_room()
+    room.deal_state = {
+        "phase": "BONUS",
+        "token": "bonus-token",
+        "initiator": initiator.client_id,
+        "target": target.client_id,
+        "number": 1,
+        "choices": {initiator.client_id: "BETRAY", target.client_id: "COOP"},
+        "bonus_player": initiator.client_id,
+    }
+
+    assert main.validate_bonus_pick(room, initiator.client_id, 2) is initiator
+
+    with pytest.raises(ValueError, match="보너스 권한"):
+        main.validate_bonus_pick(room, target.client_id, 2)
+
+    initiator.mark_number(2)
+    with pytest.raises(ValueError, match="이미 마킹된 번호"):
+        main.validate_bonus_pick(room, initiator.client_id, 2)
+
+
+@pytest.mark.asyncio
+async def test_deal_proposal_is_committed_before_clients_are_notified(monkeypatch):
+    session = FakeSession()
+    monkeypatch.setattr(main, "get_session_factory", lambda: FakeFactory(session))
+    room, initiator, target = make_playing_room("room-proposal-persisted")
+    initiator_socket = EndpointWebSocket(
+        ['{"action":"propose_deal","target_id":"target","number":1}', RuntimeError("stop")]
+    )
+    target_socket = EndpointWebSocket([])
+    initiator.ws = initiator_socket
+    target.ws = target_socket
+    main.manager.rooms[room.room_id] = room
+
+    with pytest.raises(RuntimeError, match="stop"):
+        await main.websocket_endpoint(
+            initiator_socket, room.room_id, initiator.client_id
+        )
+
+    assert session.commits == 1
+    assert room.deal_state["phase"] == "CHOICE"
+    assert room.deal_state["choices"] == {}
+    assert any(message["type"] == "open_deal" for message in target_socket.sent)
+    main.cancel_timer(room)
+    main.manager.rooms.pop(room.room_id, None)
+
+
+@pytest.mark.asyncio
+async def test_outsider_deal_choice_is_rejected_by_endpoint(monkeypatch):
+    session = FakeSession()
+    monkeypatch.setattr(main, "get_session_factory", lambda: FakeFactory(session))
+    room, initiator, target = make_playing_room("room-outsider-choice")
+    outsider_socket = EndpointWebSocket(
+        ['{"action":"deal_choice","choice":"COOP"}', WebSocketDisconnect()]
+    )
+    outsider = make_player("outsider", outsider_socket)
+    room.add_player(outsider)
+    room.deal_state = {
+        "phase": "CHOICE",
+        "token": "deal-token",
+        "initiator": initiator.client_id,
+        "target": target.client_id,
+        "number": 1,
+        "choices": {},
+    }
+    main.manager.rooms[room.room_id] = room
+
+    await main.websocket_endpoint(outsider_socket, room.room_id, outsider.client_id)
+
+    assert room.deal_state["choices"] == {}
+    assert any(
+        message["type"] == "error" and "거래 당사자" in message["message"]
+        for message in outsider_socket.sent
+    )
+    main.cancel_timer(room)
+    main.manager.rooms.pop(room.room_id, None)
+
+
+@pytest.mark.asyncio
+async def test_deal_timeout_defaults_missing_choices_and_persists(monkeypatch):
+    session = FakeSession()
+    monkeypatch.setattr(main, "get_session_factory", lambda: FakeFactory(session))
+    monkeypatch.setattr(main, "schedule_turn_timer", lambda room: None)
+    room, initiator, target = make_playing_room("room-deal-timeout")
+    room.deal_state = {
+        "phase": "CHOICE",
+        "token": "deal-token",
+        "initiator": initiator.client_id,
+        "target": target.client_id,
+        "number": 1,
+        "choices": {},
+    }
+    main.manager.rooms[room.room_id] = room
+    sent = []
+
+    async def broadcast(room_id, message):
+        sent.append(message)
+
+    monkeypatch.setattr(main.manager, "broadcast", broadcast)
+
+    await main.handle_deal_timeout(room.room_id, "deal-token")
+
+    assert session.commits == 1
+    assert room.deal_state is None
+    assert room.turn_index == 1
+    assert any("상호 배신" in message.get("message", "") for message in sent)
+    main.manager.rooms.pop(room.room_id, None)
+
+
+@pytest.mark.asyncio
+async def test_bonus_timeout_clears_pending_state_and_advances_turn(monkeypatch):
+    session = FakeSession()
+    monkeypatch.setattr(main, "get_session_factory", lambda: FakeFactory(session))
+    monkeypatch.setattr(main, "schedule_turn_timer", lambda room: None)
+    room, initiator, target = make_playing_room("room-bonus-timeout")
+    room.deal_state = {
+        "phase": "BONUS",
+        "token": "bonus-token",
+        "initiator": initiator.client_id,
+        "target": target.client_id,
+        "number": 1,
+        "choices": {initiator.client_id: "BETRAY", target.client_id: "COOP"},
+        "bonus_player": initiator.client_id,
+    }
+    main.manager.rooms[room.room_id] = room
+    sent = []
+
+    async def broadcast(room_id, message):
+        sent.append(message)
+
+    monkeypatch.setattr(main.manager, "broadcast", broadcast)
+
+    await main.handle_bonus_timeout(room.room_id, "bonus-token")
+
+    assert session.commits == 1
+    assert room.deal_state is None
+    assert room.turn_index == 1
+    assert any("기회를 넘겼습니다" in message.get("message", "") for message in sent)
     main.manager.rooms.pop(room.room_id, None)
