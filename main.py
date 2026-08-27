@@ -1,122 +1,82 @@
 import asyncio
 import json
 import random
-from typing import List, Dict, Optional, Set
+from typing import Dict
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 import uvicorn
+from database import get_session_factory
+from game_logic import Player, Room
+from repositories import (
+    ensure_room,
+    get_room_records,
+    get_room_summaries,
+    mark_player_disconnected,
+    mark_player_left,
+    save_runtime_room,
+)
 
 app = FastAPI(title="Dilemma Bingo Server")
-
-class Player:
-    def __init__(self, client_id: str, nickname: str, ws: WebSocket):
-        self.client_id = client_id
-        self.nickname = nickname
-        self.ws = ws
-        self.board: List[int] = self._generate_board()
-        self.marked: Set[int] = set()
-        self.lines: int = 0
-        self.last_target_id: Optional[str] = None
-    
-    def _generate_board(self) -> List[int]:
-        nums = list(range(1, 50))
-        random.shuffle(nums)
-        return nums
-
-    def mark_number(self, number: int):
-        if number in self.board:
-            self.marked.add(number)
-            self.lines = self._calculate_lines()
-
-    def _calculate_lines(self) -> int:
-        lines = 0
-        for r in range(7):
-            if all(self.board[r * 7 + c] in self.marked for c in range(7)): lines += 1
-        for c in range(7):
-            if all(self.board[r * 7 + c] in self.marked for r in range(7)): lines += 1
-        if all(self.board[i * 7 + i] in self.marked for i in range(7)): lines += 1
-        if all(self.board[i * 7 + (6 - i)] in self.marked for i in range(7)): lines += 1
-        return lines
-
-    def get_winning_numbers(self) -> List[int]:
-        if self.lines < 2: return []
-        lines_indices = []
-        for r in range(7): lines_indices.append([r * 7 + c for c in range(7)])
-        for c in range(7): lines_indices.append([r * 7 + c for r in range(7)])
-        lines_indices.append([i * 7 + i for i in range(7)])
-        lines_indices.append([i * 7 + (6 - i) for i in range(7)])
-        max_marks = -1
-        best_missing = []
-        for indices in lines_indices:
-            line_nums = [self.board[idx] for idx in indices]
-            marked_count = sum(1 for num in line_nums if num in self.marked)
-            if marked_count == 7: continue
-            missing_nums = [num for num in line_nums if num not in self.marked]
-            if marked_count > max_marks:
-                max_marks = marked_count
-                best_missing = missing_nums.copy()
-            elif marked_count == max_marks:
-                best_missing.extend(missing_nums)
-        return list(set(best_missing))
-
-    def to_dict(self, include_board: bool = False) -> dict:
-        data = {
-            "id": self.client_id, "nickname": self.nickname,
-            "lines": self.lines, "marked": list(self.marked),
-            "winning_nums": self.get_winning_numbers()
-        }
-        if include_board: data["board"] = self.board
-        return data
-
-class Room:
-    def __init__(self, room_id: str):
-        self.room_id = room_id
-        self.players: Dict[str, Player] = {}
-        self.player_order: List[str] = [] 
-        self.status = "WAITING" 
-        self.turn_index = 0
-        self.deal_state: Optional[Dict] = None
-        self.last_marked_num: Optional[int] = None
-        self.scores: Dict[str, int] = {} # 🚨 우승 누적 점수
-        self.timer_task: Optional[asyncio.Task] = None # 🚨 10초 타이머 태스크
-
-    def add_player(self, player: Player):
-        self.players[player.client_id] = player
-        if player.client_id not in self.player_order:
-            self.player_order.append(player.client_id)
-        if player.nickname not in self.scores:
-            self.scores[player.nickname] = 0
-
-    def remove_player(self, client_id: str):
-        if client_id in self.players:
-            del self.players[client_id]
-            self.player_order.remove(client_id)
-            if self.turn_index >= len(self.player_order):
-                self.turn_index = 0
-
-    def get_turn_player(self) -> Optional[Player]:
-        if not self.player_order: return None
-        return self.players.get(self.player_order[self.turn_index])
-
-    def next_turn(self):
-        if self.player_order:
-            self.turn_index = (self.turn_index + 1) % len(self.player_order)
-
-    def check_winners(self) -> List[Player]:
-        return [p for p in self.players.values() if p.lines >= 3]
 
 class ConnectionManager:
     def __init__(self):
         self.rooms: Dict[str, Room] = {}
+        self.room_locks: Dict[str, asyncio.Lock] = {}
 
     def get_or_create_room(self, room_id: str) -> Room:
         if room_id not in self.rooms:
             self.rooms[room_id] = Room(room_id)
         return self.rooms[room_id]
 
+    def get_room_lock(self, room_id: str) -> asyncio.Lock:
+        if room_id not in self.room_locks:
+            self.room_locks[room_id] = asyncio.Lock()
+        return self.room_locks[room_id]
+
+    async def hydrate_room(self, room_id: str) -> Room:
+        room = self.get_or_create_room(room_id)
+        async with get_session_factory()() as session:
+            db_room, db_players = await get_room_records(session, room_id)
+            if db_room is None:
+                await ensure_room(session, room_id)
+                await session.commit()
+                return room
+
+            room.status = db_room.status
+            room.turn_index = db_room.turn_index
+            room.last_marked_num = db_room.last_marked_num
+            room.deal_state = db_room.deal_state
+            room.player_order = [
+                player.client_id
+                for player in room.players.values()
+                if player.ws is not None
+            ]
+            for db_player in db_players:
+                if db_player.left_at is not None:
+                    continue
+                player = room.players.get(db_player.client_id)
+                if player is None:
+                    player = Player(
+                        db_player.client_id,
+                        db_player.nickname,
+                        None,
+                        board=list(db_player.board),
+                        marked=set(db_player.marked),
+                    )
+                    room.players[db_player.client_id] = player
+                    player.lines = db_player.lines
+                    player.last_target_id = db_player.last_target_id
+                    room.scores[db_player.client_id] = db_player.score
+                elif player.ws is None:
+                    player.nickname = db_player.nickname
+                    room.scores[db_player.client_id] = db_player.score
+        return room
+
     async def broadcast(self, room_id: str, message: dict):
         if room_id in self.rooms:
             for player in self.rooms[room_id].players.values():
+                if player.ws is None:
+                    continue
                 try: await player.ws.send_json(message)
                 except Exception: pass 
 
@@ -147,7 +107,7 @@ async def handle_turn_timeout(room_id: str, turn_index: int):
         unmarked = [num for num in player.board if num not in player.marked]
         num = random.choice(unmarked) if unmarked else player.board[0]
         room.last_marked_num = num
-        for p in room.players.values(): p.mark_number(num)
+        for p in room.active_players: p.mark_number(num)
         await manager.broadcast(room_id, {"type": "event_log", "message": f"⏳ 시간 초과! {player.nickname}님이 강제로 [{num}]을(를) 불렀습니다."})
         await _check_winners_and_next(room)
 
@@ -164,9 +124,8 @@ async def handle_deal_timeout(room_id: str, deal_num: int):
 # 🚨 API: 방 목록 조회 기능
 @app.get("/api/rooms")
 async def get_rooms():
-    active_rooms = []
-    for rid, r in manager.rooms.items():
-        active_rooms.append({"id": rid, "players": len(r.players), "status": r.status})
+    async with get_session_factory()() as session:
+        active_rooms = await get_room_summaries(session)
     return {"rooms": active_rooms}
 
 @app.get("/")
@@ -185,17 +144,36 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
             action = payload.get("action")
 
             if action == "join":
-                nickname = payload.get("nickname", f"User_{client_id[:4]}")
-                player = Player(client_id, nickname, websocket)
-                
-                if room.status == "PLAYING" and client_id not in room.players:
-                    await manager.send_personal(websocket, {"type": "error", "message": "이미 진행 중인 게임입니다."})
-                    continue
-                
-                room.add_player(player)
+                async with manager.get_room_lock(room_id):
+                    room = await manager.hydrate_room(room_id)
+                    nickname = payload.get("nickname", f"User_{client_id[:4]}")
+                    player = room.players.get(client_id)
+
+                    if room.status == "PLAYING" and player is None:
+                        await manager.send_personal(websocket, {"type": "error", "message": "이미 진행 중인 게임입니다."})
+                        continue
+
+                    if player is None:
+                        player = Player(client_id, nickname, websocket)
+                        room.add_player(player)
+                    else:
+                        player.ws = websocket
+                        player.nickname = nickname
+                        room.activate_player(player)
+
+                    async with get_session_factory()() as session:
+                        await save_runtime_room(
+                            session,
+                            room,
+                            connected_client_ids={
+                                player_id for player_id, current in room.players.items()
+                                if current.ws is not None
+                            },
+                        )
+                        await session.commit()
                 await manager.broadcast(room_id, {
                     "type": "room_update",
-                    "players": [p.to_dict() for p in room.players.values()],
+                    "players": [p.to_dict() for p in room.active_players],
                     "status": room.status,
                     "scores": room.scores
                 })
@@ -208,17 +186,22 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
 
             elif action == "leave": # 🚨 방 퇴장 및 중단 기능
                 if client_id in room.players:
-                    nickname = room.players[client_id].nickname
-                    room.remove_player(client_id)
-                    cancel_timer(room)
-                    
+                    async with manager.get_room_lock(room_id):
+                        nickname = room.players[client_id].nickname
+                        room.remove_player(client_id)
+                        cancel_timer(room)
+                        room.status = "WAITING"
+                        async with get_session_factory()() as session:
+                            await mark_player_left(session, room_id, client_id)
+                            await save_runtime_room(session, room)
+                            await session.commit()
+
                     if len(room.players) == 0:
-                        del manager.rooms[room_id] # 빈 방 삭제
+                        manager.rooms.pop(room_id, None)
                     else:
-                        room.status = "WAITING" # 누군가 나가면 게임 중단 후 대기 상태로
                         await manager.broadcast(room_id, {
                             "type": "room_update",
-                            "players": [p.to_dict() for p in room.players.values()],
+                            "players": [p.to_dict() for p in room.active_players],
                             "status": room.status,
                             "scores": room.scores
                         })
@@ -226,7 +209,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
                         await manager.broadcast(room_id, {"type": "game_stopped"})
 
             elif action == "start_game":
-                if len(room.players) < 2:
+                if len(room.active_players) < 2:
                     await manager.send_personal(websocket, {"type": "error", "message": "최소 2명 이상 필요합니다."})
                     continue
                 
@@ -236,7 +219,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
                 room.deal_state = None
                 cancel_timer(room)
                 
-                for p in room.players.values():
+                for p in room.active_players:
                     p.board = p._generate_board()
                     p.marked = set()
                     p.lines = 0
@@ -253,7 +236,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
                     cancel_timer(room)
                     number = payload.get("number")
                     room.last_marked_num = number
-                    for p in room.players.values(): p.mark_number(number)
+                    for p in room.active_players: p.mark_number(number)
                     await manager.broadcast(room_id, {"type": "event_log", "message": f"📢 [공개] {turn_player.nickname}님이 [{number}]을(를) 불렀습니다. (전원 마킹)"})
                     await _check_winners_and_next(room)
 
@@ -300,15 +283,27 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
 
     except WebSocketDisconnect:
         if client_id in room.players:
-            nickname = room.players[client_id].nickname
-            room.remove_player(client_id)
-            cancel_timer(room)
-            if len(room.players) == 0:
-                del manager.rooms[room_id]
-            else:
+            async with manager.get_room_lock(room_id):
+                nickname = room.players[client_id].nickname
                 room.status = "WAITING"
+                async with get_session_factory()() as session:
+                    await mark_player_disconnected(session, room_id, client_id)
+                    await save_runtime_room(
+                        session,
+                        room,
+                        connected_client_ids={
+                            player_id for player_id in room.players
+                            if player_id != client_id
+                        },
+                    )
+                    await session.commit()
+                room.remove_player(client_id)
+                cancel_timer(room)
+            if len(room.players) == 0:
+                manager.rooms.pop(room_id, None)
+            else:
                 await manager.broadcast(room_id, {
-                    "type": "room_update", "players": [p.to_dict() for p in room.players.values()],
+                    "type": "room_update", "players": [p.to_dict() for p in room.active_players],
                     "status": room.status, "scores": room.scores
                 })
                 await manager.broadcast(room_id, {"type": "event_log", "message": f"🏃 {nickname}님이 퇴장했습니다. 대기 모드로 전환됩니다."})
@@ -338,7 +333,7 @@ async def _resolve_deal(room: Room):
         room.deal_state = None
         await _check_winners_and_next(room)
     elif c_init == "BETRAY" and c_target == "BETRAY":
-        for p in room.players.values():
+        for p in room.active_players:
             if p.client_id not in [initiator_id, target_id]: p.mark_number(number)
         await manager.broadcast(room.room_id, {"type": "event_log", "message": f"💥 [상호 배신 파멸!] 기회는 날아가고, 나머지 전원에게 [{number}] 공짜 마킹!"})
         room.deal_state = None
@@ -361,10 +356,10 @@ async def _check_winners_and_next(room: Room):
         winner_names = []
         for w in winners:
             winner_names.append(w.nickname)
-            room.scores[w.nickname] += 1 # 🚨 우승자 점수 1점 획득
+            room.scores[w.client_id] += 1
         await manager.broadcast(room.room_id, {
             "type": "game_over", "winners": winner_names, "scores": room.scores,
-            "players": [p.to_dict() for p in room.players.values()]
+            "players": [p.to_dict() for p in room.active_players]
         })
     else:
         room.next_turn()
@@ -376,7 +371,7 @@ async def _notify_turn(room: Room):
         await manager.broadcast(room.room_id, {
             "type": "turn_update", "turn_client_id": turn_player.client_id,
             "turn_nickname": turn_player.nickname, "last_marked_num": room.last_marked_num,
-            "players": [p.to_dict(include_board=False) for p in room.players.values()],
+            "players": [p.to_dict(include_board=False) for p in room.active_players],
             "scores": room.scores
         })
         # 🚨 일반 턴 10초 타이머 시작

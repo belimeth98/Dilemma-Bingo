@@ -4,4 +4,6 @@ SQLAlchemy>=2.0
 asyncmy
 alembic
 pydantic-settings
+pytest
+pytest-asyncio
 
