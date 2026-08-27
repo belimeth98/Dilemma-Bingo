@@ -1,6 +1,8 @@
 import pytest
+from types import SimpleNamespace
 
 from game_logic import Player, Room
+import main
 from main import _check_winners_and_next
 
 
@@ -10,6 +12,7 @@ def make_player(client_id: str, ws: object | None = object()) -> Player:
 
 def test_reconnect_preserves_player_state():
     room = Room("room-1")
+    room.current_game_id = 1
     player = make_player("client-1", None)
     player.marked = {1, 2, 3}
     player.lines = 2
@@ -42,8 +45,35 @@ def test_offline_players_are_excluded_from_active_players_and_turns():
 
 
 @pytest.mark.asyncio
-async def test_winner_score_uses_client_id():
+async def test_winner_score_uses_client_id(monkeypatch):
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_value, traceback):
+            return False
+
+        async def get(self, model, identity):
+            if model.__name__ == "Game":
+                return SimpleNamespace(status="PLAYING", ended_at=None)
+            return None
+
+        def add(self, record):
+            pass
+
+        async def flush(self):
+            pass
+
+        async def commit(self):
+            pass
+
+        async def rollback(self):
+            pass
+
+    monkeypatch.setattr(main, "get_session_factory", lambda: lambda: FakeSession())
     room = Room("room-1")
+    room.status = "PLAYING"
+    room.current_game_id = 1
     winner = make_player("client-1")
     winner.nickname = "same-name"
     winner.lines = 3
@@ -54,3 +84,6 @@ async def test_winner_score_uses_client_id():
     assert room.status == "ENDED"
     assert room.scores["client-1"] == 1
     assert "same-name" not in room.scores
+
+    await _check_winners_and_next(room)
+    assert room.scores["client-1"] == 1

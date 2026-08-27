@@ -5,6 +5,8 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from models import Game as GameRecord
+from models import GameResult as GameResultRecord
 from models import Room as RoomRecord
 from models import RoomPlayer as RoomPlayerRecord
 
@@ -26,6 +28,16 @@ async def get_room_records(
         .order_by(RoomPlayerRecord.joined_at, RoomPlayerRecord.client_id)
     )
     return room, list(result)
+
+
+async def create_game(session: AsyncSession, room: Any) -> GameRecord:
+    db_room = await ensure_room(session, room.room_id, room.status)
+    game = GameRecord(room_id=room.room_id, status="PLAYING")
+    session.add(game)
+    await session.flush()
+    db_room.current_game_id = game.id
+    room.current_game_id = game.id
+    return game
 
 
 async def get_room_summaries(session: AsyncSession) -> list[dict[str, Any]]:
@@ -75,6 +87,7 @@ async def save_runtime_room(
     db_room.turn_index = room.turn_index
     db_room.last_marked_num = room.last_marked_num
     db_room.deal_state = room.deal_state
+    db_room.current_game_id = room.current_game_id
 
     connected_ids = (
         set(connected_client_ids)
@@ -108,6 +121,43 @@ async def save_runtime_room(
             db_player.left_at = None
 
     return db_room
+
+
+async def finish_game(
+    session: AsyncSession, room: Any, winners: Iterable[Any]
+) -> None:
+    if room.current_game_id is None:
+        raise RuntimeError("PLAYING 방에 current_game_id가 없습니다.")
+    game = await session.get(GameRecord, room.current_game_id)
+    if game is None:
+        raise RuntimeError(f"게임을 찾을 수 없습니다: {room.current_game_id}")
+    game.status = "ENDED"
+    game.ended_at = utc_now()
+
+    winner_ids = {winner.client_id for winner in winners}
+    for player in room.active_players:
+        score_delta = 1 if player.client_id in winner_ids else 0
+        db_player = await session.get(
+            RoomPlayerRecord,
+            {"room_id": room.room_id, "client_id": player.client_id},
+        )
+        if db_player is not None:
+            db_player.score = room.scores.get(player.client_id, 0)
+        existing_result = await session.get(
+            GameResultRecord,
+            {"game_id": room.current_game_id, "client_id": player.client_id},
+        )
+        if existing_result is None:
+            session.add(
+                GameResultRecord(
+                    game_id=room.current_game_id,
+                    client_id=player.client_id,
+                    nickname=player.nickname,
+                    final_lines=player.lines,
+                    won=player.client_id in winner_ids,
+                    score_delta=score_delta,
+                )
+            )
 
 
 async def mark_player_disconnected(

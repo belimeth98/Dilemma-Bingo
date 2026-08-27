@@ -93,6 +93,8 @@ class Room:
         self.deal_state: Optional[Dict] = None
         self.last_marked_num: Optional[int] = None
         self.scores: Dict[str, int] = {}
+        self.current_game_id: Optional[int] = None
+        self.last_winners: List[str] = []
         self.timer_task: Optional[asyncio.Task] = None
 
     @property
