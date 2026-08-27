@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>7x7 심리전 딜레마 빙고</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css');
+        body { font-family: 'Pretendard', sans-serif; background-color: #0f172a; color: #f8fafc; }
+        
+        .grid-7x7 { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; }
+        .tile {
+            aspect-ratio: 1; display: flex; align-items: center; justify-content: center;
+            font-size: 1.25rem; font-weight: bold; border-radius: 0.375rem; cursor: pointer;
+            background-color: #334155; color: #e2e8f0; transition: all 0.2s ease;
+        }
+        .tile:hover { background-color: #475569; }
+        .tile.marked { background-color: #10b981; color: #064e3b; box-shadow: 0 0 10px rgba(16, 185, 129, 0.4); pointer-events: none; }
+        .tile.selected { border: 2px solid #f59e0b; background-color: #475569; }
+        .tile.bonus-mode:not(.marked):hover { background-color: #f43f5e; color: white; }
+        
+        .tile.last-marked {
+            background-color: #eab308; color: #422006; box-shadow: 0 0 15px rgba(234, 179, 8, 0.8);
+            border: 2px solid #fef08a; transform: scale(1.05); z-index: 10; animation: pulse-ring 1.5s infinite;
+        }
+        @keyframes pulse-ring { 0% { box-shadow: 0 0 0 0 rgba(234,179,8,0.7); } 70% { box-shadow: 0 0 0 10px rgba(234,179,8,0); } 100% { box-shadow: 0 0 0 0 rgba(234,179,8,0); } }
+
+        .tile.deal-target {
+            background-color: #9333ea; color: #ffffff; box-shadow: 0 0 20px rgba(147, 51, 234, 0.9);
+            border: 3px solid #d8b4fe; transform: scale(1.15); z-index: 20; animation: pulse-purple 1s infinite;
+        }
+        @keyframes pulse-purple { 0% { box-shadow: 0 0 0 0 rgba(147,51,234,0.8); } 70% { box-shadow: 0 0 0 15px rgba(147,51,234,0); } 100% { box-shadow: 0 0 0 0 rgba(147,51,234,0); } }
+
+        .timer-bar { width: 100%; height: 10px; background-color: #3b82f6; border-radius: 9999px; }
+        .timer-active { animation: shrink-timer 10s linear forwards; }
+        @keyframes shrink-timer {
+            0% { width: 100%; background-color: #3b82f6; }
+            50% { background-color: #f59e0b; }
+            100% { width: 0%; background-color: #ef4444; }
+        }
+
+        #toast-container { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); z-index: 100; display: flex; flex-direction: column; gap: 10px; }
+        .toast { padding: 12px 24px; border-radius: 8px; font-weight: bold; font-size: 1.1rem; animation: slideDown 0.3s ease, fadeOut 0.5s ease 2.5s forwards; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); }
+        .toast.info { background-color: #3b82f6; color: white; }
+        .toast.success { background-color: #10b981; color: white; }
+        .toast.warning { background-color: #f59e0b; color: black; }
+        .toast.error { background-color: #ef4444; color: white; }
+        @keyframes slideDown { from { transform: translateY(-20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+        @keyframes fadeOut { to { opacity: 0; display: none; } }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+    </style>
+</head>
+<body class="min-h-screen p-4 flex flex-col items-center text-base sm:text-lg overflow-x-hidden">
+
+    <div id="toast-container"></div>
+
+    <div class="w-full max-w-6xl relative">
+        <header class="text-center mb-8 mt-2 relative">
+            <h1 class="text-4xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-emerald-400">⚔️ 7x7 딜레마 빙고</h1>
+            
+            <button id="btn-leave-game" onclick="requestLeave()" class="hidden absolute top-0 right-0 px-4 py-2 bg-rose-600 hover:bg-rose-500 rounded-lg text-white text-sm font-bold shadow transition-colors">
+                🚪 중단 및 나가기
+            </button>
+        </header>
+
+        <!-- 로비 (입장 화면) -->
+        <main id="view-lobby" class="flex flex-col items-center justify-center max-w-4xl mx-auto w-full">
+            
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-8 w-full">
+                <!-- 새 방 접속 폼 -->
+                <div class="bg-slate-800 p-8 rounded-xl shadow-xl">
+                    <h2 class="text-2xl font-bold mb-4 text-emerald-400">새로운 방 접속/생성</h2>
+                    <div class="space-y-4">
+                        <div>
+                            <label class="block text-slate-300 font-bold mb-2">방 코드 (Room Code)</label>
+                            <input type="text" id="input-room" class="w-full p-4 rounded-lg bg-slate-700 border border-slate-600 focus:outline-none focus:border-emerald-500 font-bold" placeholder="예: room_1" value="room_1">
+                        </div>
+                        <div>
+                            <label class="block text-slate-300 font-bold mb-2">사용할 닉네임</label>
+                            <input type="text" id="input-nickname" class="w-full p-4 rounded-lg bg-slate-700 border border-slate-600 focus:outline-none focus:border-emerald-500 font-bold" placeholder="이름을 입력하세요">
+                        </div>
+                        <button onclick="connectToServer()" class="w-full py-4 mt-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-lg rounded-lg shadow-lg transition-colors">🚀 방 입장하기</button>
+                    </div>
+                </div>
+
+                <!-- 서버 방 목록 리스트 -->
+                <div class="bg-slate-800 p-8 rounded-xl shadow-xl flex flex-col">
+                    <div class="flex justify-between items-center mb-4">
+                        <h2 class="text-2xl font-bold text-blue-400">현재 대기중인 방</h2>
+                        <button onclick="fetchRooms()" class="text-sm bg-slate-700 hover:bg-slate-600 px-3 py-1 rounded text-white font-bold transition">🔄 새로고침</button>
+                    </div>
+                    <ul id="room-list" class="flex-1 overflow-y-auto space-y-3 no-scrollbar text-sm font-medium">
+                        <!-- JS 렌더링 -->
+                    </ul>
+                </div>
+            </div>
+
+            <!-- 대기실 상태 -->
+            <div id="lobby-waiting" class="w-full max-w-lg hidden mt-8 p-6 border-2 border-emerald-500 rounded-xl text-center bg-slate-800 shadow-2xl relative">
+                <p class="text-slate-300 mb-6 text-lg">방 인원: <span id="lobby-player-count" class="font-bold text-emerald-400 text-3xl">1</span>명</p>
+                <div class="flex gap-4">
+                    <button onclick="requestLeave()" class="flex-1 py-4 bg-rose-600 hover:bg-rose-500 text-white font-bold text-lg rounded-lg shadow-lg transition-colors">나가기</button>
+                    <button onclick="sendStartGame()" class="flex-[2] py-4 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-lg rounded-lg shadow-lg transition-colors">게임 시작하기</button>
+                </div>
+            </div>
+            
+            <!-- 룰 안내 영역 -->
+            <div class="w-full mt-10 bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-lg">
+                <h3 class="text-lg font-bold text-amber-400 mb-4 flex items-center justify-between">
+                    <span>📖 생존 규칙 안내 (10초 타임어택)</span>
+                    <span id="rule-counter" class="text-sm font-medium text-slate-400 bg-slate-900 px-3 py-1 rounded-full">1 / 4</span>
+                </h3>
+                <div class="flex items-center justify-between gap-4">
+                    <button onclick="prevRule()" class="p-3 bg-slate-700 hover:bg-slate-600 rounded-full shadow transition-colors"><svg class="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"></path></svg></button>
+                    <div id="rule-content" class="flex-1 min-h-[220px] flex items-center justify-center text-center"></div>
+                    <button onclick="nextRule()" class="p-3 bg-slate-700 hover:bg-slate-600 rounded-full shadow transition-colors"><svg class="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path></svg></button>
+                </div>
+            </div>
+        </main>
+
+        <!-- 게임 본 화면 (3열 레이아웃으로 변경) -->
+        <main id="view-game" class="hidden grid grid-cols-1 md:grid-cols-3 gap-6 w-full mt-6">
+
+            <!-- 좌측 2열: 내 빙고판 & 메인 타이머 -->
+            <div class="md:col-span-2 flex flex-col h-full relative">
+                <!-- 다이내믹 10초 타이머 -->
+                <div class="w-full bg-slate-700 h-3 rounded-full mb-4 overflow-hidden shadow-inner">
+                    <div id="global-timer" class="timer-bar"></div>
+                </div>
+
+                <div class="bg-slate-800 p-5 sm:p-8 rounded-xl shadow-xl flex-1 flex flex-col border border-slate-700">
+                    <div class="flex justify-between items-end mb-6 border-b border-slate-700 pb-4">
+                        <h2 class="text-2xl font-bold">내 빙고판</h2>
+                        <div class="text-right">
+                            <span class="text-sm text-slate-400 block font-bold">달성 줄 수</span>
+                            <span id="ui-my-lines" class="text-4xl font-extrabold text-blue-400">0</span>
+                            <span class="text-xl text-slate-500 font-bold"> / 3</span>
+                        </div>
+                    </div>
+                    
+                    <div id="bonus-banner" class="hidden w-full bg-rose-600 text-white font-bold text-center py-3 rounded-lg mb-6 animate-pulse text-lg shadow-lg">
+                        🗡️ 배신 성공! 보너스 칸 1개를 누르세요 (10초)
+                    </div>
+
+                    <div id="bingo-board" class="grid-7x7 w-full max-w-xl mx-auto mb-6"></div>
+
+                    <div id="danger-banner" class="hidden mt-auto bg-rose-950 border-2 border-rose-600 rounded-xl p-5 shadow-[0_0_15px_rgba(225,29,72,0.4)] text-center transition-all">
+                        <h4 class="text-rose-400 font-extrabold text-xl mb-3 tracking-wide">🚨 1등 주의보 🚨</h4>
+                        <div id="danger-list" class="text-white text-base space-y-3"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 우측 1열: 사이드바 컨트롤 -->
+            <div class="flex flex-col space-y-6">
+                <div class="bg-slate-800 p-6 rounded-xl shadow-xl">
+                    <h3 class="text-xl font-bold mb-4 border-b border-slate-700 pb-3">진행 현황</h3>
+                    <p class="text-slate-300 font-bold text-lg">현재 턴: <span id="ui-current-turn" class="inline-block px-4 py-1 bg-amber-500 text-black font-extrabold rounded-full ml-2">-</span></p>
+                    
+                    <div id="action-panel" class="hidden mt-6 pt-5 border-t border-slate-700">
+                        <h4 class="font-bold text-emerald-400 text-xl mb-3">👉 당신의 턴입니다! (10초)</h4>
+                        <p class="text-sm text-slate-400 mb-4 font-medium leading-relaxed">1. 빙고판 번호 선택<br>2. 방식 전송 (무응답시 강제콜)</p>
+                        
+                        <div class="bg-slate-900 p-4 rounded-lg text-center mb-4 border border-slate-700 flex justify-center items-center gap-3">
+                            <span class="text-base text-slate-400 font-bold">선택:</span>
+                            <span id="ui-selected-num" class="text-2xl font-black text-amber-500">없음</span>
+                        </div>
+                        <button onclick="sendPublicCall()" class="w-full py-4 bg-blue-600 hover:bg-blue-500 rounded-lg font-bold text-lg mb-3 shadow transition">📢 전원 공개 콜</button>
+                        
+                        <div class="flex flex-col space-y-3 mt-4 pt-4 border-t border-slate-700">
+                            <label class="text-sm text-slate-400 font-bold">비밀 거래 대상 (무응답시 배신):</label>
+                            <select id="select-target" class="w-full bg-slate-900 text-base font-bold rounded-lg p-3 border border-slate-600 outline-none focus:border-purple-500"></select>
+                            <button onclick="sendSecretDeal()" class="w-full py-3 bg-purple-600 hover:bg-purple-500 rounded-lg font-bold text-lg shadow transition">🤫 비밀 거래 제안</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="bg-slate-800 p-5 rounded-xl shadow-xl flex-1 flex flex-col">
+                    <h3 class="text-lg font-bold mb-3 border-b border-slate-700 pb-2">실시간 빙고 줄수</h3>
+                    <ul id="ui-player-list" class="space-y-2 text-sm flex-1"></ul>
+                </div>
+
+                <div class="bg-slate-800 p-5 rounded-xl shadow-xl h-48 flex flex-col">
+                    <h3 class="text-lg font-bold mb-2">사건 일지</h3>
+                    <div id="ui-event-logs" class="flex-1 overflow-y-auto no-scrollbar text-sm space-y-2 bg-slate-900 p-3 rounded-lg border border-slate-700 font-medium leading-relaxed"></div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- 비밀 거래 모달 -->
+    <div id="modal-deal" class="hidden fixed inset-0 bg-black/80 flex items-center justify-center z-40 backdrop-blur-sm px-4 transition-all duration-300">
+        <div id="modal-deal-content" class="bg-slate-800 p-8 md:p-10 rounded-3xl shadow-2xl w-full max-w-lg text-center border-4 border-purple-500 transition-opacity duration-300 relative">
+            
+            <div class="absolute -top-6 left-1/2 -translate-x-1/2 bg-rose-600 text-white font-black px-6 py-2 rounded-full shadow-lg border-2 border-white animate-pulse">
+                ⏳ 10초 내 응답 필수 (무응답=배신)
+            </div>
+
+            <h2 class="text-3xl font-bold text-purple-400 mb-3 mt-4">🤫 비밀 거래 도착!</h2>
+            <p class="text-slate-300 mb-4 font-medium text-lg"><span id="modal-partner-name" class="font-extrabold text-white">상대방</span>님과 공유</p>
+            
+            <div class="bg-slate-900 border-2 border-slate-700 p-4 rounded-2xl mb-6 shadow-inner inline-block min-w-[150px]">
+                <span id="modal-deal-number" class="text-7xl font-black text-amber-500">7</span>
+            </div>
+
+            <div class="grid grid-cols-2 gap-5 mb-6">
+                <button onclick="submitDealChoice('COOP')" class="py-5 bg-emerald-600 hover:bg-emerald-500 rounded-xl font-bold text-xl shadow-lg transition-transform hover:scale-105">🤝 협동</button>
+                <button onclick="submitDealChoice('BETRAY')" class="py-5 bg-rose-600 hover:bg-rose-500 rounded-xl font-bold text-xl shadow-lg transition-transform hover:scale-105">🗡️ 배신</button>
+            </div>
+            
+            <button id="btn-peek" class="w-full py-4 bg-slate-700 hover:bg-slate-600 active:bg-slate-500 rounded-xl font-bold text-slate-300 shadow border border-slate-500 text-lg transition-colors select-none">
+                👀 꾹 누르고 내 빙고판 확인
+            </button>
+        </div>
+    </div>
+
+    <!-- 승리 팝업 모달 (랭킹 제외) -->
+    <div id="modal-game-over" class="hidden fixed inset-0 bg-black/80 flex items-center justify-center z-50 backdrop-blur-md px-4 transition-all duration-300">
+        <div class="bg-slate-800 p-8 md:p-10 rounded-3xl shadow-2xl w-full max-w-lg text-center border-4 border-blue-500">
+            <h2 class="text-4xl font-black text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-emerald-400 mb-4 animate-bounce">🏆 게임 종료!</h2>
+            <p class="text-slate-300 mb-6 font-medium text-lg">이번 판 우승자</p>
+            
+            <div class="bg-slate-900 border-2 border-slate-700 p-6 rounded-2xl mb-8 shadow-inner">
+                <span id="modal-winner-names" class="text-4xl font-black text-amber-400 drop-shadow-md"></span>
+            </div>
+
+            <button onclick="backToLobbyWaiting()" class="w-full py-5 bg-blue-600 hover:bg-blue-500 rounded-xl font-bold text-xl shadow-lg text-white transition-transform hover:scale-105">
+                대기실로 돌아가기 (다시하기)
+            </button>
+        </div>
+    </div>
+
+    <script>
+        const rules = [
+            {
+                title: "📢 공개 콜 (안전)", color: "text-blue-400",
+                desc: "전원이 함께 번호를 지웁니다. 견제 없이 안전하게 내 빙고를 채우고 싶을 때 사용하세요.",
+                example: "내가 '12'를 부르면, 방 안의 인원 모두 자신의 빙고판에서 '12'를 지웁니다."
+            },
+            {
+                title: "🤝 상호 협동", color: "text-emerald-400",
+                desc: "비밀 거래를 제안받은 둘 다 [협동]을 선택하면, 다른 3명을 따돌리고 둘만 해당 번호를 마킹합니다.",
+                example: "나와 짝꿍이 '7'로 거래해서 둘 다 협동하면, 우리 둘만 '7'을 지우고 나머지 3명은 지우지 못합니다."
+            },
+            {
+                title: "🗡️ 단독 배신 (대박)", color: "text-purple-400",
+                desc: "상대는 [협동]을 눌렀는데 나만 [배신]을 누르면 성공! 나는 거래 번호와 자유 1칸을 추가로 칠합니다.",
+                example: "짝꿍은 협동했는데 나만 배신하면, 나는 '7'과 '원하는 보너스 1칸'을 지우고 짝꿍은 아무것도 지우지 못합니다."
+            },
+            {
+                title: "💥 상호 배신 (최악)", color: "text-rose-400",
+                desc: "서로 욕심을 부려 둘 다 [배신]을 누르면 거래 무효! 턴을 날리고 엉뚱한 사람들에게만 이득을 줍니다.",
+                example: "우리 둘 다 배신하면 턴이 통째로 날아가고, 거래를 구경하던 나머지 인원만 '7'을 공짜로 지우게 됩니다!"
+            }
+        ];
+        
+        let currentRuleIdx = 0;
+        function updateRuleUI() {
+            const rule = rules[currentRuleIdx];
+            document.getElementById('rule-counter').innerText = `${currentRuleIdx + 1} / ${rules.length}`;
+            document.getElementById('rule-content').innerHTML = `
+                <div class="w-full px-2 fade-in">
+                    <h4 class="text-xl font-extrabold ${rule.color} mb-3">${rule.title}</h4>
+                    <p class="text-base text-slate-200 mb-4 leading-relaxed break-keep font-medium">${rule.desc}</p>
+                    <div class="bg-slate-900 border border-slate-700 p-4 rounded-xl text-left inline-block w-full">
+                        <div class="flex items-center gap-2 mb-1">
+                            <span class="text-lg">💡</span><span class="text-sm font-bold text-amber-300">이해를 돕는 예시</span>
+                        </div>
+                        <p class="text-sm font-medium text-slate-300 mt-1 leading-relaxed break-keep">${rule.example}</p>
+                    </div>
+                </div>
+            `;
+        }
+        function prevRule() { currentRuleIdx = (currentRuleIdx - 1 + rules.length) % rules.length; updateRuleUI(); }
+        function nextRule() { currentRuleIdx = (currentRuleIdx + 1) % rules.length; updateRuleUI(); }
+        
+        window.addEventListener('DOMContentLoaded', () => { 
+            updateRuleUI(); 
+            fetchRooms(); 
+        });
+
+        async function fetchRooms() {
+            try {
+                const res = await fetch('/api/rooms');
+                const data = await res.json();
+                const list = document.getElementById('room-list');
+                list.innerHTML = '';
+                if(data.rooms.length === 0) {
+                    list.innerHTML = '<li class="text-slate-500 text-center py-4">생성된 방이 없습니다. 코드를 입력해 첫 방을 만드세요!</li>';
+                    return;
+                }
+                data.rooms.forEach(r => {
+                    const li = document.createElement('li');
+                    li.className = "flex justify-between items-center bg-slate-700 p-3 rounded-lg border border-slate-600";
+                    li.innerHTML = `
+                        <span class="font-bold text-lg text-white"># ${r.id}</span>
+                        <div class="flex items-center gap-4">
+                            <span class="text-slate-300">${r.players}명 참여중</span>
+                            <button onclick="joinSpecificRoom('${r.id}')" class="${r.status==='PLAYING'?'bg-rose-600':'bg-blue-600 hover:bg-blue-500'} px-4 py-1.5 rounded font-bold text-white shadow">
+                                ${r.status==='PLAYING' ? '게임중' : '입장'}
+                            </button>
+                        </div>
+                    `;
+                    list.appendChild(li);
+                });
+            } catch(e) { console.error('방 목록 불러오기 실패'); }
+        }
+
+        function joinSpecificRoom(roomId) {
+            document.getElementById('input-room').value = roomId;
+            connectToServer();
+        }
+
+        const modalDeal = document.getElementById('modal-deal');
+        const modalContent = document.getElementById('modal-deal-content');
+        const btnPeek = document.getElementById('btn-peek');
+        function startPeek(e) {
+            if(e && e.type !== 'mousedown') e.preventDefault(); 
+            modalDeal.classList.remove('bg-black/80', 'backdrop-blur-sm'); modalDeal.classList.add('bg-black/10'); 
+            modalContent.classList.add('opacity-10', 'pointer-events-none');
+        }
+        function endPeek() {
+            modalDeal.classList.add('bg-black/80', 'backdrop-blur-sm'); modalDeal.classList.remove('bg-black/10');
+            modalContent.classList.remove('opacity-10', 'pointer-events-none');
+        }
+        btnPeek.addEventListener('mousedown', startPeek); window.addEventListener('mouseup', endPeek);
+        btnPeek.addEventListener('touchstart', startPeek); window.addEventListener('touchend', endPeek);
+
+        function resetTimerAnimation() {
+            const timerEl = document.getElementById('global-timer');
+            timerEl.classList.remove('timer-active');
+            void timerEl.offsetWidth; 
+            timerEl.classList.add('timer-active');
+        }
+        function stopTimerAnimation() {
+            document.getElementById('global-timer').classList.remove('timer-active');
+        }
+
+        let ws = null;
+        let myClientId = null;
+        let myBoard = [];
+        let myMarked = [];
+        let selectedNumber = null;
+        let isMyTurn = false;
+        let isBonusMode = false;
+        let playersData = [];
+        let lastMarkedNum = null; 
+        let dealProposedNumber = null; 
+
+        const viewLobby = document.getElementById('view-lobby');
+        const viewGame = document.getElementById('view-game');
+        const boardEl = document.getElementById('bingo-board');
+        const logsEl = document.getElementById('ui-event-logs');
+        const btnLeaveGame = document.getElementById('btn-leave-game');
+
+        function showToast(message, type = 'info') {
+            const container = document.getElementById('toast-container');
+            const toast = document.createElement('div');
+            toast.className = `toast ${type}`; toast.innerText = message;
+            container.appendChild(toast);
+            setTimeout(() => { if(container.contains(toast)) container.removeChild(toast); }, 3000);
+        }
+
+        function getClientId() {
+            let cid = localStorage.getItem('bingo_client_id');
+            if (!cid) { cid = 'client_' + Math.random().toString(36).substring(2, 10); localStorage.setItem('bingo_client_id', cid); }
+            return cid;
+        }
+
+        function connectToServer() {
+            const roomId = document.getElementById('input-room').value.trim();
+            const nickname = document.getElementById('input-nickname').value.trim() || '익명';
+            if (!roomId) return showToast('방 코드를 입력해주세요.', 'warning');
+
+            myClientId = getClientId();
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${window.location.host}/ws/${roomId}/${myClientId}`);
+
+            ws.onopen = () => {
+                showToast('서버에 접속했습니다.', 'success');
+                document.querySelector('#view-lobby .grid').classList.add('hidden');
+                document.getElementById('lobby-waiting').classList.remove('hidden');
+                ws.send(JSON.stringify({ action: 'join', nickname: nickname }));
+            };
+            ws.onmessage = (event) => { handleServerMessage(JSON.parse(event.data)); };
+            ws.onerror = () => { showToast('서버 접속 에러.', 'error'); };
+            ws.onclose = () => { 
+                showToast('홈으로 돌아왔습니다.', 'info'); 
+                resetToHome();
+            };
+        }
+
+        function sendStartGame() { if(ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ action: 'start_game' })); }
+        
+        function requestLeave() {
+            if(ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ action: 'leave' }));
+                ws.close();
+            } else { resetToHome(); }
+        }
+
+        function resetToHome() {
+            viewGame.classList.add('hidden');
+            btnLeaveGame.classList.add('hidden');
+            document.getElementById('modal-game-over').classList.add('hidden');
+            
+            viewLobby.classList.remove('hidden');
+            document.querySelector('#view-lobby .grid').classList.remove('hidden');
+            document.getElementById('lobby-waiting').classList.add('hidden');
+            
+            fetchRooms(); 
+        }
+        
+        function backToLobbyWaiting() {
+            document.getElementById('modal-game-over').classList.add('hidden');
+            viewGame.classList.add('hidden');
+            btnLeaveGame.classList.add('hidden');
+            viewLobby.classList.remove('hidden');
+            document.getElementById('lobby-waiting').classList.remove('hidden');
+        }
+
+        function handleServerMessage(data) {
+            switch (data.type) {
+                case 'room_update':
+                    playersData = data.players;
+                    document.getElementById('lobby-player-count').innerText = playersData.length;
+                    updatePlayerListUI();
+                    break;
+                case 'game_started':
+                    myBoard = data.board; myMarked = data.marked;
+                    lastMarkedNum = dealProposedNumber = null;
+                    
+                    document.getElementById('modal-game-over').classList.add('hidden');
+                    document.getElementById('danger-banner').classList.add('hidden');
+                    document.getElementById('ui-event-logs').innerHTML = '';
+                    
+                    viewLobby.classList.add('hidden');
+                    viewGame.classList.remove('hidden');
+                    btnLeaveGame.classList.remove('hidden');
+                    renderBoard();
+                    break;
+                case 'turn_update':
+                    playersData = data.players;
+                    lastMarkedNum = data.last_marked_num; 
+                    isMyTurn = (data.turn_client_id === myClientId);
+                    dealProposedNumber = null;
+                    
+                    resetTimerAnimation();
+                    
+                    document.getElementById('ui-current-turn').innerText = data.turn_nickname;
+                    const actionPanel = document.getElementById('action-panel');
+                    if (isMyTurn) {
+                        actionPanel.classList.remove('hidden');
+                        selectedNumber = null;
+                        document.getElementById('ui-selected-num').innerText = '없음';
+                        updateTargetSelect();
+                    } else actionPanel.classList.add('hidden');
+                    
+                    const me = playersData.find(p => p.id === myClientId);
+                    if (me) { myMarked = me.marked; document.getElementById('ui-my-lines').innerText = me.lines; }
+                    
+                    updatePlayerListUI(); updateDangerBanner(playersData); renderBoard();
+                    break;
+                case 'event_log':
+                    addLog(data.message);
+                    break;
+                case 'open_deal':
+                    dealProposedNumber = data.number;
+                    resetTimerAnimation();
+                    document.getElementById('modal-deal-number').innerText = dealProposedNumber;
+                    document.getElementById('modal-partner-name').innerText = data.partner_name;
+                    document.getElementById('modal-deal').classList.remove('hidden');
+                    renderBoard();
+                    break;
+                case 'require_bonus':
+                    isBonusMode = true;
+                    resetTimerAnimation();
+                    document.getElementById('bonus-banner').classList.remove('hidden');
+                    showToast('배신 성공! 번호를 고르세요 (10초)', 'warning');
+                    renderBoard();
+                    break;
+                case 'game_over':
+                    stopTimerAnimation();
+                    playersData = data.players;
+                    const meFinal = playersData.find(p => p.id === myClientId);
+                    if (meFinal) { myMarked = meFinal.marked; document.getElementById('ui-my-lines').innerText = meFinal.lines; }
+                    updatePlayerListUI(); renderBoard();
+                    
+                    document.getElementById('modal-winner-names').innerText = data.winners.join(', ');
+                    document.getElementById('modal-game-over').classList.remove('hidden');
+                    document.getElementById('action-panel').classList.add('hidden');
+                    document.getElementById('ui-current-turn').innerText = "게임 종료";
+                    break;
+                case 'game_stopped':
+                    stopTimerAnimation();
+                    showToast('누군가 방을 나가 게임이 중단되었습니다.', 'warning');
+                    backToLobbyWaiting();
+                    break;
+                case 'error':
+                    showToast(data.message, 'error');
+                    break;
+            }
+        }
+
+        function updateDangerBanner(players) {
+            const dangerPlayers = players.filter(p => p.lines >= 2 && p.winning_nums && p.winning_nums.length > 0);
+            const banner = document.getElementById('danger-banner');
+            const listEl = document.getElementById('danger-list');
+            if (dangerPlayers.length > 0) {
+                listEl.innerHTML = ''; 
+                dangerPlayers.forEach(p => {
+                    const div = document.createElement('div');
+                    div.className = "bg-slate-900/60 p-3 rounded-lg border border-rose-800/50 flex flex-col gap-1";
+                    div.innerHTML = `<span class="text-amber-400 font-bold text-lg">[${p.nickname}] 3줄 달성 임박!</span>
+                                     <span>⚠️ 필수 견제: <span class="inline-block bg-rose-600 px-3 py-1 mt-1 rounded text-white font-black text-lg shadow">${p.winning_nums.join(', ')}</span></span>`;
+                    listEl.appendChild(div);
+                });
+                banner.classList.remove('hidden');
+            } else banner.classList.add('hidden');
+        }
+
+        function renderBoard() {
+            boardEl.innerHTML = '';
+            myBoard.forEach(num => {
+                const tile = document.createElement('div'); tile.className = 'tile';
+                const isMarked = myMarked.includes(num);
+                if (isMarked) tile.classList.add('marked');
+                if (selectedNumber === num) tile.classList.add('selected');
+                if (isBonusMode && !isMarked) tile.classList.add('bonus-mode');
+                if (lastMarkedNum === num) tile.classList.add('last-marked');
+                if (dealProposedNumber === num && !isMarked) tile.classList.add('deal-target');
+                
+                tile.innerText = num;
+                tile.onclick = () => {
+                    if (isBonusMode) {
+                        if (!isMarked) {
+                            ws.send(JSON.stringify({ action: 'bonus_pick', number: num }));
+                            isBonusMode = false;
+                            document.getElementById('bonus-banner').classList.add('hidden');
+                            stopTimerAnimation();
+                        } return;
+                    }
+                    if (isMyTurn && !isMarked) {
+                        selectedNumber = num; document.getElementById('ui-selected-num').innerText = num; renderBoard(); 
+                    }
+                };
+                boardEl.appendChild(tile);
+            });
+        }
+
+        function updatePlayerListUI() {
+            const listEl = document.getElementById('ui-player-list');
+            listEl.innerHTML = '';
+            const sortedPlayers = [...playersData].sort((a, b) => b.lines - a.lines);
+            sortedPlayers.forEach(p => {
+                const li = document.createElement('li');
+                const isDanger = (p.lines >= 2); 
+                li.className = `flex justify-between items-center p-2.5 rounded-lg font-bold ${isDanger ? 'bg-rose-950/70 border border-rose-900/50' : 'bg-slate-700'}`;
+                const isMe = p.id === myClientId ? "(나)" : "";
+                li.innerHTML = `
+                    <span class="${isDanger ? 'text-rose-400' : 'text-slate-100'}">${p.nickname} <span class="text-xs text-slate-400">${isMe}</span> ${isDanger ? '🚨' : ''}</span>
+                    <span class="${isDanger ? 'bg-rose-900 text-rose-300' : 'bg-slate-800 text-blue-400'} px-2 py-1 rounded-md">${p.lines} 줄</span>
+                `;
+                listEl.appendChild(li);
+            });
+        }
+
+        function updateTargetSelect() {
+            const selectEl = document.getElementById('select-target'); selectEl.innerHTML = '';
+            playersData.forEach(p => {
+                if (p.id !== myClientId) {
+                    const opt = document.createElement('option'); opt.value = p.id; opt.innerText = p.nickname;
+                    selectEl.appendChild(opt);
+                }
+            });
+        }
+
+        function addLog(msg) {
+            const p = document.createElement('p'); p.innerText = msg;
+            logsEl.appendChild(p); logsEl.scrollTop = logsEl.scrollHeight;
+        }
+
+        function sendPublicCall() {
+            if (!selectedNumber) return showToast('먼저 빙고판에서 번호를 선택하세요.', 'warning');
+            ws.send(JSON.stringify({ action: 'public_call', number: selectedNumber }));
+        }
+
+        function sendSecretDeal() {
+            if (!selectedNumber) return showToast('비밀 거래할 번호를 선택하세요.', 'warning');
+            const targetId = document.getElementById('select-target').value;
+            if (!targetId) return showToast('거래할 대상을 선택하세요.', 'warning');
+            ws.send(JSON.stringify({ action: 'propose_deal', target_id: targetId, number: selectedNumber }));
+        }
+
+        function submitDealChoice(choice) {
+            dealProposedNumber = null; stopTimerAnimation();
+            ws.send(JSON.stringify({ action: 'deal_choice', choice: choice }));
+            document.getElementById('modal-deal').classList.add('hidden');
+            renderBoard();
+        }
+    </script>
+</body>
+</html>
