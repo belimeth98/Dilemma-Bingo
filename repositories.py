@@ -58,11 +58,12 @@ async def get_room_summaries(session: AsyncSession) -> list[dict[str, Any]]:
 
     summaries: dict[str, dict[str, Any]] = {}
     for room_id, status, client_id in result:
+        if client_id is None:
+            continue
         summary = summaries.setdefault(
             room_id, {"id": room_id, "players": 0, "status": status}
         )
-        if client_id is not None:
-            summary["players"] += 1
+        summary["players"] += 1
     return list(summaries.values())
 
 

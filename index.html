@@ -310,6 +310,13 @@
 
         function joinSpecificRoom(roomId) {
             document.getElementById('input-room').value = roomId;
+            const nicknameInput = document.getElementById('input-nickname');
+            if (!nicknameInput.value.trim()) {
+                nicknameInput.focus();
+                nicknameInput.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                showToast('참여할 닉네임을 입력해주세요.', 'warning');
+                return;
+            }
             connectToServer();
         }
 
@@ -345,6 +352,7 @@
         let selectedNumber = null;
         let isMyTurn = false;
         let isBonusMode = false;
+        let isBonusSubmitting = false;
         let playersData = [];
         let lastMarkedNum = null; 
         let dealProposedNumber = null; 
@@ -371,8 +379,13 @@
 
         function connectToServer() {
             const roomId = document.getElementById('input-room').value.trim();
-            const nickname = document.getElementById('input-nickname').value.trim() || '익명';
+            const nicknameInput = document.getElementById('input-nickname');
+            const nickname = nicknameInput.value.trim();
             if (!roomId) return showToast('방 코드를 입력해주세요.', 'warning');
+            if (!nickname) {
+                nicknameInput.focus();
+                return showToast('닉네임을 입력해주세요.', 'warning');
+            }
 
             myClientId = getClientId();
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -414,11 +427,20 @@
         }
         
         function backToLobbyWaiting() {
+            clearPendingActionUI();
             document.getElementById('modal-game-over').classList.add('hidden');
             viewGame.classList.add('hidden');
             btnLeaveGame.classList.add('hidden');
             viewLobby.classList.remove('hidden');
             document.getElementById('lobby-waiting').classList.remove('hidden');
+        }
+
+        function clearPendingActionUI() {
+            isBonusMode = false;
+            isBonusSubmitting = false;
+            dealProposedNumber = null;
+            document.getElementById('modal-deal').classList.add('hidden');
+            document.getElementById('bonus-banner').classList.add('hidden');
         }
 
         function handleServerMessage(data) {
@@ -429,6 +451,7 @@
                     updatePlayerListUI();
                     break;
                 case 'game_started':
+                    clearPendingActionUI();
                     myBoard = data.board; myMarked = data.marked;
                     lastMarkedNum = dealProposedNumber = null;
                     
@@ -442,6 +465,7 @@
                     renderBoard();
                     break;
                 case 'turn_update':
+                    clearPendingActionUI();
                     playersData = data.players;
                     lastMarkedNum = data.last_marked_num; 
                     isMyTurn = (data.turn_client_id === myClientId);
@@ -467,6 +491,7 @@
                     addLog(data.message);
                     break;
                 case 'open_deal':
+                    clearPendingActionUI();
                     dealProposedNumber = data.number;
                     resetTimerAnimation();
                     document.getElementById('modal-deal-number').innerText = dealProposedNumber;
@@ -475,6 +500,9 @@
                     renderBoard();
                     break;
                 case 'require_bonus':
+                    clearPendingActionUI();
+                    if (Array.isArray(data.marked)) myMarked = data.marked;
+                    if (typeof data.lines === 'number') document.getElementById('ui-my-lines').innerText = data.lines;
                     isBonusMode = true;
                     resetTimerAnimation();
                     document.getElementById('bonus-banner').classList.remove('hidden');
@@ -482,6 +510,7 @@
                     renderBoard();
                     break;
                 case 'game_over':
+                    clearPendingActionUI();
                     stopTimerAnimation();
                     playersData = data.players;
                     const meFinal = playersData.find(p => p.id === myClientId);
@@ -494,11 +523,13 @@
                     document.getElementById('ui-current-turn').innerText = "게임 종료";
                     break;
                 case 'game_stopped':
+                    clearPendingActionUI();
                     stopTimerAnimation();
                     showToast('누군가 방을 나가 게임이 중단되었습니다.', 'warning');
                     backToLobbyWaiting();
                     break;
                 case 'error':
+                    if (isBonusMode) isBonusSubmitting = false;
                     showToast(data.message, 'error');
                     break;
             }
@@ -535,11 +566,9 @@
                 tile.innerText = num;
                 tile.onclick = () => {
                     if (isBonusMode) {
-                        if (!isMarked) {
+                        if (!isMarked && !isBonusSubmitting) {
+                            isBonusSubmitting = true;
                             ws.send(JSON.stringify({ action: 'bonus_pick', number: num }));
-                            isBonusMode = false;
-                            document.getElementById('bonus-banner').classList.add('hidden');
-                            stopTimerAnimation();
                         } return;
                     }
                     if (isMyTurn && !isMarked) {

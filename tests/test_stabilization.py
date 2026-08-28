@@ -8,7 +8,12 @@ import main
 from game_logic import Player, Room
 from models import Game as GameRecord
 from models import GameResult as GameResultRecord
-from repositories import finish_game, mark_player_disconnected, save_runtime_room
+from repositories import (
+    finish_game,
+    get_room_summaries,
+    mark_player_disconnected,
+    save_runtime_room,
+)
 
 
 class FakeSession:
@@ -100,6 +105,25 @@ class EndpointWebSocket:
 
 def make_player(client_id="client-1", ws=object()):
     return Player(client_id, client_id, ws, board=list(range(1, 50)))
+
+
+@pytest.mark.asyncio
+async def test_room_summaries_exclude_rooms_without_connected_players():
+    class SummarySession:
+        async def execute(self, statement):
+            return [
+                ("empty-room", "WAITING", None),
+                ("waiting-room", "WAITING", "one"),
+                ("waiting-room", "WAITING", "two"),
+                ("playing-room", "PLAYING", "three"),
+            ]
+
+    summaries = await get_room_summaries(SummarySession())
+
+    assert summaries == [
+        {"id": "waiting-room", "players": 2, "status": "WAITING"},
+        {"id": "playing-room", "players": 1, "status": "PLAYING"},
+    ]
 
 
 @pytest.mark.asyncio
@@ -209,6 +233,40 @@ async def test_websocket_endpoint_join_reaches_hydrate_and_save(monkeypatch):
     assert any(message["type"] == "room_update" for message in websocket.sent)
     assert session.commits >= 1
     main.manager.rooms.pop("room-join", None)
+
+
+@pytest.mark.asyncio
+async def test_websocket_endpoint_rejects_blank_nickname(monkeypatch):
+    session = FakeSession()
+    monkeypatch.setattr(main, "get_session_factory", lambda: FakeFactory(session))
+    websocket = EndpointWebSocket([
+        '{"action":"join","nickname":"   "}',
+        WebSocketDisconnect(),
+    ])
+
+    await main.websocket_endpoint(websocket, "room-blank-name", "client-blank-name")
+
+    assert websocket.accepted
+    assert websocket.sent == [{"type": "error", "message": "닉네임을 입력해주세요."}]
+    assert session.commits == 0
+    assert "client-blank-name" not in main.manager.rooms["room-blank-name"].players
+    main.manager.rooms.pop("room-blank-name", None)
+
+
+def test_frontend_requires_nickname_before_connecting():
+    html = main.INDEX_FILE.read_text(encoding="utf-8")
+    join_specific_room = html.split("function joinSpecificRoom(roomId) {", 1)[1].split(
+        "const modalDeal", 1
+    )[0]
+    connect_to_server = html.split("function connectToServer() {", 1)[1].split(
+        "myClientId = getClientId();", 1
+    )[0]
+
+    assert "if (!nicknameInput.value.trim())" in join_specific_room
+    assert "참여할 닉네임을 입력해주세요." in join_specific_room
+    assert "if (!nickname)" in connect_to_server
+    assert "닉네임을 입력해주세요." in connect_to_server
+    assert "|| '익명'" not in connect_to_server
 
 
 @pytest.mark.asyncio
@@ -360,6 +418,36 @@ async def test_current_turn_disconnect_moves_turn_and_notifies(monkeypatch):
 
     assert room.get_turn_player() is second
     assert notifications == ["second"]
+    main.manager.rooms.pop(room.room_id, None)
+
+
+@pytest.mark.asyncio
+async def test_explicit_leave_stops_game_and_returns_room_to_waiting(monkeypatch):
+    session = FakeSession()
+    monkeypatch.setattr(main, "get_session_factory", lambda: FakeFactory(session))
+    room = Room("room-explicit-leave")
+    room.status = "PLAYING"
+    room.current_game_id = 1
+    leaving_socket = EndpointWebSocket(
+        ['{"action":"leave"}', WebSocketDisconnect()]
+    )
+    remaining_socket = EndpointWebSocket([])
+    leaving = make_player("leaving", leaving_socket)
+    remaining = make_player("remaining", remaining_socket)
+    room.add_player(leaving)
+    room.add_player(remaining)
+    main.manager.rooms[room.room_id] = room
+
+    await main.websocket_endpoint(leaving_socket, room.room_id, leaving.client_id)
+
+    assert room.status == "WAITING"
+    assert leaving.client_id not in room.players
+    assert remaining.client_id in room.players
+    assert any(
+        message["type"] == "room_update" and message["status"] == "WAITING"
+        for message in remaining_socket.sent
+    )
+    assert any(message["type"] == "game_stopped" for message in remaining_socket.sent)
     main.manager.rooms.pop(room.room_id, None)
 
 
@@ -783,3 +871,81 @@ async def test_bonus_timeout_clears_pending_state_and_advances_turn(monkeypatch)
     assert room.turn_index == 1
     assert any("기회를 넘겼습니다" in message.get("message", "") for message in sent)
     main.manager.rooms.pop(room.room_id, None)
+
+
+@pytest.mark.asyncio
+async def test_bonus_prompt_contains_latest_marked_state(monkeypatch):
+    room, initiator, target = make_playing_room("room-bonus-prompt")
+    initiator.mark_number(1)
+    sent = []
+
+    async def send_personal(websocket, message):
+        sent.append(message)
+
+    async def broadcast(room_id, message):
+        return None
+
+    monkeypatch.setattr(main.manager, "send_personal", send_personal)
+    monkeypatch.setattr(main.manager, "broadcast", broadcast)
+    monkeypatch.setattr(main, "schedule_bonus_timer", lambda current_room: None)
+
+    await main._publish_deal_resolution(
+        room,
+        {"message": "betrayal", "bonus_player": initiator.client_id},
+    )
+
+    assert sent == [
+        {
+            "type": "require_bonus",
+            "marked": [1],
+            "lines": initiator.lines,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_restored_bonus_prompt_contains_latest_marked_state(monkeypatch):
+    room, initiator, target = make_playing_room("room-restored-bonus")
+    initiator.mark_number(1)
+    room.deal_state = {
+        "phase": "BONUS",
+        "token": "bonus-token",
+        "initiator": initiator.client_id,
+        "target": target.client_id,
+        "number": 1,
+        "choices": {initiator.client_id: "BETRAY", target.client_id: "COOP"},
+        "bonus_player": initiator.client_id,
+    }
+    sent = []
+
+    async def send_personal(websocket, message):
+        sent.append(message)
+
+    monkeypatch.setattr(main.manager, "send_personal", send_personal)
+
+    await main._restore_pending_action(room, initiator)
+
+    assert sent == [
+        {
+            "type": "require_bonus",
+            "marked": [1],
+            "lines": initiator.lines,
+        }
+    ]
+
+
+def test_frontend_clears_pending_ui_and_waits_for_bonus_confirmation():
+    html = main.INDEX_FILE.read_text(encoding="utf-8")
+
+    assert "function clearPendingActionUI()" in html
+    for message_type in ("game_started", "turn_update", "game_over", "game_stopped"):
+        message_case = html.split(f"case '{message_type}':", 1)[1].split("case '", 1)[0]
+        assert "clearPendingActionUI();" in message_case
+
+    bonus_case = html.split("case 'require_bonus':", 1)[1].split("case '", 1)[0]
+    assert "Array.isArray(data.marked)" in bonus_case
+    assert "isBonusMode = true;" in bonus_case
+
+    bonus_click = html.split("if (isBonusMode) {", 1)[1].split("if (isMyTurn", 1)[0]
+    assert "!isBonusSubmitting" in bonus_click
+    assert "isBonusMode = false" not in bonus_click

@@ -428,9 +428,17 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, client_id: str)
             action = payload.get("action")
 
             if action == "join":
+                raw_nickname = payload.get("nickname")
+                nickname = raw_nickname.strip() if isinstance(raw_nickname, str) else ""
+                if not nickname:
+                    await manager.send_personal(
+                        websocket,
+                        {"type": "error", "message": "닉네임을 입력해주세요."},
+                    )
+                    continue
+
                 async with manager.get_room_lock(room_id):
                     room = await manager.hydrate_room(room_id)
-                    nickname = payload.get("nickname", f"User_{client_id[:4]}")
                     player = room.players.get(client_id)
 
                     if room.status == "PLAYING" and player is None:
@@ -833,7 +841,14 @@ async def _publish_deal_resolution(room: Room, resolution: dict) -> None:
     if bonus_player_id:
         bonus_player = room.players.get(bonus_player_id)
         if bonus_player and bonus_player.ws is not None:
-            await manager.send_personal(bonus_player.ws, {"type": "require_bonus"})
+            await manager.send_personal(
+                bonus_player.ws,
+                {
+                    "type": "require_bonus",
+                    "marked": list(bonus_player.marked),
+                    "lines": bonus_player.lines,
+                },
+            )
         schedule_bonus_timer(room)
     else:
         await _broadcast_room_transition(room)
@@ -863,7 +878,14 @@ async def _restore_pending_action(room: Room, player: Player) -> None:
             },
         )
     elif phase == "BONUS" and state.get("bonus_player") == player.client_id:
-        await manager.send_personal(player.ws, {"type": "require_bonus"})
+        await manager.send_personal(
+            player.ws,
+            {
+                "type": "require_bonus",
+                "marked": list(player.marked),
+                "lines": player.lines,
+            },
+        )
 
 async def _check_winners_and_next(
     room: Room,
