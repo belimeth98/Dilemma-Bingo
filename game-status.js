@@ -105,12 +105,19 @@
         turn.append(element('span', 'turn-label', label), element('span', 'turn-name', name));
         const players = element('div', 'players');
         players.setAttribute('aria-label', '참가자와 완성 줄 수');
-        game.players.forEach(player => {
+        const connectedPlayers = game.players.filter(player => player.connected);
+        connectedPlayers.slice(0, 6).forEach(player => {
             const current = player.id === game.turn?.id;
-            players.append(element('span', `player${current ? ' current' : ''}`, `${current ? '▶ ' : ''}${player.nickname} · ${player.lines}줄${player.connected ? '' : ' · 접속 대기'}`));
+            const label = `${current ? '▶ ' : ''}${player.nickname} · ${player.lines}줄`;
+            const chip = element('span', `player${current ? ' current' : ''}`, label);
+            chip.title = label;
+            players.append(chip);
         });
+        if (connectedPlayers.length > 6) {
+            players.append(element('span', 'player', `외 ${connectedPlayers.length - 6}명 접속 중`));
+        }
         summary.append(turn, players);
-        const dangerPlayers = game.players.filter(player => player.lines >= 2 && player.winning_nums.length > 0);
+        const dangerPlayers = connectedPlayers.filter(player => player.lines >= 2 && player.winning_nums.length > 0);
         if (dangerPlayers.length) {
             const danger = element('div', 'danger');
             danger.setAttribute('aria-label', '승리 임박 참가자와 견제 번호');

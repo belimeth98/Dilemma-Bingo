@@ -2,7 +2,7 @@ import asyncio
 import copy
 import json
 import random
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Dict
 from uuid import uuid4
@@ -13,6 +13,7 @@ from sqlalchemy import text
 
 import uvicorn
 from database import dispose_engine, get_session_factory
+from cleanup import run_player_cleanup
 from game_logic import Player, Room
 from spectator import PublicGameStatus, create_spectator_router
 from repositories import (
@@ -32,9 +33,13 @@ INDEX_FILE = BASE_DIR / "index.html"
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    cleanup_task = asyncio.create_task(run_player_cleanup(manager), name="departed-player-cleanup")
     try:
         yield
     finally:
+        cleanup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await cleanup_task
         await dispose_engine()
 
 

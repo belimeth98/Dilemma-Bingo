@@ -12,7 +12,6 @@ from fastapi.responses import FileResponse
 from sqlalchemy import func, select
 
 from database import get_session_factory
-from game_logic import Player
 from models import Game, Room, RoomPlayer
 
 logger = logging.getLogger(__name__)
@@ -166,15 +165,11 @@ class PublicGameStatus:
         names = {}
         for saved in saved_players:
             current = runtime.players.get(saved.client_id) if runtime else None
-            if current:
-                players.append(public_player(current, current.ws is not None, public_ids[saved.client_id]))
+            # Only live connections belong in the spectator participant list.
+            # Saved connected flags may be stale after a server restart.
+            if current is not None and current.ws is not None:
+                players.append(public_player(current, True, public_ids[saved.client_id]))
                 names[saved.client_id] = current.nickname
-            else:
-                player = Player(saved.client_id, saved.nickname, None,
-                                board=list(saved.board), marked=set(saved.marked))
-                player.lines = saved.lines
-                players.append(public_player(player, False, public_ids[saved.client_id]))
-                names[saved.client_id] = saved.nickname
 
         # Runtime order is authoritative; get_turn_player() may mutate turn_index.
         active_players = runtime.active_players if runtime else []

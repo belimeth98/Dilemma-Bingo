@@ -328,3 +328,40 @@ async def test_failed_game_write_does_not_publish_spectator_logs(monkeypatch):
     assert room.last_marked_num is None
     assert status.game_logs(1, 1)['total'] == 0
     assert websocket.sent[-1]['type'] == 'error'
+
+@pytest.mark.asyncio
+async def test_six_connected_players_are_visible_but_offline_players_are_not(setup_status):
+    status, manager, seed, engine = setup_status
+    room = seed(1)
+    for index in range(2, 8):
+        connected = index < 6
+        player = Player(f'private-reconnect-1-{index}', f'추가참가자{index}', object() if connected else None,
+                        board=list(range(1, 50)))
+        if not connected:
+            for number in range(1, 21):
+                player.mark_number(number)
+        room.add_player(player)
+        with Session(engine) as session:
+            session.add(RoomPlayer(room_id=room.room_id, client_id=player.client_id, nickname=player.nickname,
+                                   board=player.board, marked=list(player.marked), lines=player.lines, connected=True))
+            session.commit()
+    result = (await status.snapshot())['games'][0]
+    assert len(result['players']) == 6
+    assert all(player['connected'] for player in result['players'])
+    assert {'추가참가자2', '추가참가자3', '추가참가자4', '추가참가자5'} <= {p['nickname'] for p in result['players']}
+    assert '추가참가자6' not in json.dumps(result, ensure_ascii=False)
+    assert '추가참가자7' not in json.dumps(result, ensure_ascii=False)
+    assert len(room.players) == 8  # Hiding does not remove anyone from the game.
+
+
+@pytest.mark.asyncio
+async def test_disconnection_hides_player_and_reconnection_restores_it(setup_status):
+    status, _, seed, _ = setup_status
+    room = seed(1)
+    player = room.active_players[1]
+    player.ws = None
+    hidden = (await status.snapshot())['games'][0]
+    assert [p['nickname'] for p in hidden['players']] == ['하늘']
+    player.ws = object()
+    restored = (await status.snapshot())['games'][0]
+    assert [p['nickname'] for p in restored['players']] == ['하늘', '바다']

@@ -55,8 +55,8 @@
         .turn-label { color: #94a3b8; font-size: 12px; flex-shrink: 0; }
         .turn-name { color: #fbbf24; font-weight: 800; overflow-wrap: anywhere; }
         .trading .turn-name { color: #d8b4fe; }
-        .players { display: flex; gap: 6px; flex-wrap: wrap; max-height: 54px; overflow: auto; margin: 9px 0; }
-        .player { font-size: 11px; color: #cbd5e1; border: 1px solid #475569; border-radius: 6px; padding: 4px 7px; max-width: 100%; overflow-wrap: anywhere; }
+        .players { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin: 9px 0; }
+        .player { font-size: 11px; color: #cbd5e1; border: 1px solid #475569; border-radius: 6px; padding: 4px 7px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .player.current { border-color: #f59e0b88; color: #fcd34d; }
         .danger { background: #4c051955; border: 1px solid #be123c88; color: #fda4af; padding: 8px 10px; border-radius: 8px; font-size: 12px; line-height: 1.6; margin-bottom: 9px; max-height: 78px; overflow: auto; overflow-wrap: anywhere; }
         .danger strong { color: #fbbf24; }
@@ -89,7 +89,7 @@
             .grid[data-count="1"] .game-summary { width: 36%; }
             .grid[data-count="1"] .logs { border-top: 0; border-left: 1px solid #334155; padding: 0 0 0 32px; }
             .grid[data-count="1"] .turn { padding: 20px; font-size: 23px; flex-direction: column; gap: 8px; }
-            .grid[data-count="1"] .players { max-height: 240px; margin: 20px 0; }
+            .grid[data-count="1"] .players { grid-template-columns: repeat(2, minmax(0, 1fr)); margin: 20px 0; }
             .grid[data-count="1"] .player { padding: 9px 12px; font-size: 14px; }
             .grid[data-count="1"] .danger { font-size: 15px; padding: 16px; max-height: 220px; }
             .grid[data-count="1"] .log-list li { padding: 18px 0; font-size: 16px; }
@@ -107,6 +107,7 @@
             .grid { height: auto; grid-template-columns: minmax(0, 1fr); grid-template-rows: none; grid-auto-rows: minmax(350px, auto); }
             .grid[data-count="1"], .grid[data-count="2"] { grid-template-rows: none; height: auto; }
             .grid[data-count="1"] { min-height: 60dvh; }
+            .players { grid-template-columns: repeat(2, minmax(0, 1fr)); }
             .game-card { padding: 16px; }
             .game-card.trading { padding: 15px; }
             .log-list { max-height: 240px; }

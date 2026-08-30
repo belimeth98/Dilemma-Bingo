@@ -2,7 +2,7 @@ from collections.abc import Iterable
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import Game as GameRecord
@@ -182,3 +182,49 @@ async def mark_player_left(
         player.connected = False
         player.left_at = utc_now()
         player.last_seen_at = player.left_at
+
+async def get_departed_player_candidates(
+    session: AsyncSession, cutoff: datetime, limit: int = 500
+) -> list[tuple[str, str]]:
+    """Only explicit departures expire; unexpected disconnects remain resumable."""
+    result = await session.execute(
+        select(RoomPlayerRecord.room_id, RoomPlayerRecord.client_id)
+        .where(
+            RoomPlayerRecord.connected.is_(False),
+            RoomPlayerRecord.left_at.is_not(None),
+            RoomPlayerRecord.left_at <= cutoff,
+        )
+        .order_by(RoomPlayerRecord.left_at, RoomPlayerRecord.room_id, RoomPlayerRecord.client_id)
+        .limit(limit)
+    )
+    return list(result)
+
+
+async def delete_departed_players(
+    session: AsyncSession,
+    room_id: str,
+    client_ids: Iterable[str],
+    cutoff: datetime,
+    protected_ids: Iterable[str] = (),
+) -> list[str]:
+    """Recheck expiry under a row lock. The caller owns commit and the room lock."""
+    candidates = set(client_ids) - set(protected_ids)
+    if not candidates:
+        return []
+    conditions = (
+        RoomPlayerRecord.room_id == room_id,
+        RoomPlayerRecord.client_id.in_(candidates),
+        RoomPlayerRecord.connected.is_(False),
+        RoomPlayerRecord.left_at.is_not(None),
+        RoomPlayerRecord.left_at <= cutoff,
+    )
+    expired_ids = list(await session.scalars(
+        select(RoomPlayerRecord.client_id).where(*conditions).with_for_update()
+    ))
+    if expired_ids:
+        await session.execute(
+            delete(RoomPlayerRecord).where(
+                *conditions, RoomPlayerRecord.client_id.in_(expired_ids)
+            )
+        )
+    return expired_ids
