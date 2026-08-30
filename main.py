@@ -14,6 +14,7 @@ from sqlalchemy import text
 import uvicorn
 from database import dispose_engine, get_session_factory
 from game_logic import Player, Room
+from spectator import PublicGameStatus, create_spectator_router
 from repositories import (
     create_game,
     ensure_room,
@@ -95,6 +96,7 @@ class ConnectionManager:
         return room
 
     async def broadcast(self, room_id: str, message: dict):
+        public_game_status.record_event(self.rooms.get(room_id), message)
         if room_id in self.rooms:
             for player in self.rooms[room_id].players.values():
                 if player.ws is None:
@@ -107,6 +109,8 @@ class ConnectionManager:
         except Exception: pass
 
 manager = ConnectionManager()
+public_game_status = PublicGameStatus(manager)
+app.include_router(create_spectator_router(public_game_status, BASE_DIR))
 
 
 def get_current_connection_player(
