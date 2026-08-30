@@ -212,3 +212,19 @@ async def test_lifespan_stops_scheduler_before_disposing_database(monkeypatch):
     async with main.lifespan(main.app):
         await asyncio.wait_for(started.wait(), timeout=1)
     assert order == ['started', 'stopped', 'disposed']
+
+
+@pytest.mark.asyncio
+async def test_default_scheduler_waits_24_hours_without_changing_retention(monkeypatch):
+    waits = []
+    async def sweep(manager):
+        return 0
+    async def stop_after_wait(delay):
+        waits.append(delay)
+        raise asyncio.CancelledError()
+    monkeypatch.setattr(cleanup, 'cleanup_departed_players', sweep)
+    monkeypatch.setattr(cleanup.asyncio, 'sleep', stop_after_wait)
+    with pytest.raises(asyncio.CancelledError):
+        await cleanup.run_player_cleanup(object())
+    assert waits == [24 * 60 * 60]
+    assert cleanup.RETENTION == timedelta(hours=24)

@@ -20,6 +20,34 @@
     let revision = 0;
     const cards = new Map();
     const tradeStates = new Map();
+    const watchedStorageKey = 'bingo_spectator_watched_games_v1';
+    const watchedGameIds = new Set(readWatchedGames());
+    let lastSnapshot = null;
+
+    function readWatchedGames() {
+        try {
+            const saved = JSON.parse(sessionStorage.getItem('bingo_spectator_watched_games_v1') || '[]');
+            return Array.isArray(saved) ? saved.filter(id => Number.isInteger(id) && id > 0 && id <= 2147483647) : [];
+        } catch { return []; }
+    }
+    function saveWatchedGames() {
+        // Tab-local preference only. No server data or other viewer is changed.
+        try { sessionStorage.setItem(watchedStorageKey, JSON.stringify([...watchedGameIds])); } catch { /* Keep working in memory when storage is unavailable. */ }
+    }
+    function dismissFinishedGame(gameId) {
+        const game = lastSnapshot?.games.find(item => item.id === gameId);
+        if (!game || game.status !== 'ENDED') return;
+        watchedGameIds.delete(gameId);
+        saveWatchedGames();
+        delete logPages[String(gameId)];
+        const remaining = Math.max(0, lastSnapshot.total - 1);
+        const pages = Math.max(1, Math.ceil(remaining / pageSize));
+        render({ ...lastSnapshot, games: lastSnapshot.games.filter(item => item.id !== gameId),
+            total: remaining, finished_total: Math.max(0, lastSnapshot.finished_total - 1),
+            total_pages: pages, page: Math.min(page, pages) }, true);
+        subscribe();
+        document.getElementById('announcer').textContent = '종료된 게임을 내 관전 목록에서 닫았습니다.';
+    }
     const timeFormat = new Intl.DateTimeFormat('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
     const startFormat = new Intl.DateTimeFormat('ko-KR', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false });
 
@@ -46,7 +74,7 @@
     function subscribe() {
         revision += 1;
         if (socket && socket.readyState === WebSocket.OPEN) {
-            socket.send(JSON.stringify({ page, page_size: pageSize, log_pages: logPages, request_id: revision }));
+            socket.send(JSON.stringify({ page, page_size: pageSize, log_pages: logPages, request_id: revision, watched_game_ids: [...watchedGameIds] }));
         }
     }
     function movePage(delta) {
@@ -83,19 +111,33 @@
     function populateCard(card, game) {
         const focusedAction = card.contains(document.activeElement) ? document.activeElement.dataset.logAction : null;
         card.replaceChildren();
-        card.className = `game-card${game.deal ? ' trading' : ''}${game.paused ? ' paused' : ''}`;
+        const finished = game.status === 'ENDED';
+        card.className = `game-card${finished ? ' finished' : ''}${game.deal ? ' trading' : ''}${game.paused ? ' paused' : ''}`;
         card.setAttribute('aria-label', `${game.room_id} 게임 현황`);
         const heading = element('div', 'card-heading');
         const title = element('div');
         title.append(element('h2', '', `# ${game.room_id}`), element('p', 'card-meta', `GAME ${game.id} · ${startFormat.format(new Date(game.started_at))} 시작`));
         const phase = game.deal?.phase;
-        heading.append(title, element('span', 'badge', game.paused ? '연결 대기' : phase === 'BONUS' ? '보너스 선택' : game.deal ? '비밀 거래 중' : '진행 중'));
+        const actions = element('div', 'card-actions');
+        actions.append(element('span', 'badge', finished ? '게임 종료' : game.paused ? '연결 대기' : phase === 'BONUS' ? '보너스 선택' : game.deal ? '비밀 거래 중' : '진행 중'));
+        if (finished) {
+            const close = element('button', 'close-result', '×');
+            close.type = 'button';
+            close.setAttribute('aria-label', `${game.room_id} 게임 ${game.id} 종료 결과 닫기`);
+            close.title = '내 관전 목록에서만 닫기';
+            close.addEventListener('click', () => dismissFinishedGame(game.id));
+            actions.append(close);
+        }
+        heading.append(title, actions);
         const content = element('div', 'card-content');
         const summary = element('div', 'game-summary');
-        const turn = element('div', 'turn');
+        const turn = element('div', finished ? 'turn winner-result' : 'turn');
         let label = '현재 차례';
         let name = game.turn ? `${game.turn.nickname} 님` : '참가자 재접속 대기';
-        if (phase === 'BONUS') {
+        if (finished) {
+            label = game.winners.length > 1 ? '🏆 공동 우승' : '🏆 우승자';
+            name = game.winners.length ? game.winners.join(', ') : '우승 기록이 없습니다';
+        } else if (phase === 'BONUS') {
             label = '보너스 선택';
             name = game.deal.bonus_name ? `${game.deal.bonus_name} 님` : '참가자 재접속 대기';
         } else if (game.deal) {
@@ -117,6 +159,9 @@
             players.append(element('span', 'player', `외 ${connectedPlayers.length - 6}명 접속 중`));
         }
         summary.append(turn, players);
+        if (finished) {
+            summary.append(element('p', 'result-note', `${game.ended_at ? startFormat.format(new Date(game.ended_at)) + ' 종료 · ' : ''}X를 눌러 닫기 전까지 결과가 유지됩니다.`));
+        }
         const dangerPlayers = connectedPlayers.filter(player => player.lines >= 2 && player.winning_nums.length > 0);
         if (dangerPlayers.length) {
             const danger = element('div', 'danger');
@@ -143,20 +188,27 @@
             list.append(row);
         });
         logs.append(logHeading, list);
-        if (!game.logs.items.length) logs.append(element('p', 'log-empty', '새로운 공개 기록을 기다리고 있어요.'));
+        if (!game.logs.items.length) logs.append(element('p', 'log-empty', finished ? '보관된 공개 로그가 없습니다.' : '새로운 공개 기록을 기다리고 있어요.'));
         content.append(summary, logs);
         card.append(heading, content);
         if (focusedAction) card.querySelector(`[data-log-action="${focusedAction}"]`)?.focus({ preventScroll: true });
     }
 
-    function render(data) {
+    function render(data, localOnly = false) {
+        lastSnapshot = data;
         hasSnapshot = true;
-        notice.hidden = true;
-        setConnection('live', '실시간 연결');
+        data.games.forEach(game => watchedGameIds.add(game.id));
+        saveWatchedGames();
+        if (!localOnly) {
+            notice.hidden = true;
+            setConnection('live', '실시간 연결');
+        }
         page = data.page;
         totalPages = data.total_pages;
         grid.dataset.count = String(data.page_size);
-        document.getElementById('game-total').textContent = String(data.total);
+        document.getElementById('game-total').textContent = String(data.active_total ?? data.total);
+        document.getElementById('finished-total').textContent = String(data.finished_total || 0);
+        document.getElementById('finished-summary').hidden = !data.finished_total;
         document.getElementById('page-label').textContent = `${page} / ${totalPages}`;
         previous.disabled = page <= 1;
         next.disabled = page >= totalPages;
@@ -170,6 +222,10 @@
             const id = String(game.id);
             let record = cards.get(id);
             if (!record) { record = { node: element('article', 'game-card'), signature: '' }; cards.set(id, record); }
+            if (game.status === 'ENDED' && record.status !== 'ENDED') {
+                alerts.push(`${game.room_id} 게임 종료. ${game.winners.length ? '우승자 ' + game.winners.join(', ') : '우승 기록 없음'}`);
+            }
+            record.status = game.status;
             const signature = JSON.stringify(game);
             if (signature !== record.signature) {
                 populateCard(record.node, game);

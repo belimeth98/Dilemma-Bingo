@@ -11,7 +11,7 @@ from repositories import delete_departed_players, get_departed_player_candidates
 
 logger = logging.getLogger(__name__)
 RETENTION = timedelta(hours=24)
-CLEANUP_INTERVAL_SECONDS = 10 * 60
+CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60
 CLEANUP_BATCH_SIZE = 500
 
 

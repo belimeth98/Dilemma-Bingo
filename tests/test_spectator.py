@@ -365,3 +365,146 @@ async def test_disconnection_hides_player_and_reconnection_restores_it(setup_sta
     player.ws = object()
     restored = (await status.snapshot())['games'][0]
     assert [p['nickname'] for p in restored['players']] == ['하늘', '바다']
+
+
+def finish_saved_game(engine, room, *, winner_ids=None):
+    from models import GameResult
+    winner_ids = set(winner_ids or [room.active_players[0].client_id])
+    room.status = 'ENDED'
+    room.last_winners = [p.nickname for p in room.active_players if p.client_id in winner_ids]
+    with Session(engine) as session:
+        session.get(SavedRoom, room.room_id).status = 'ENDED'
+        game = session.get(Game, room.current_game_id)
+        game.status = 'ENDED'
+        game.ended_at = datetime(2026, 8, 30, 13)
+        for player in room.active_players:
+            session.add(GameResult(game_id=game.id, client_id=player.client_id, nickname=player.nickname,
+                                   final_lines=3 if player.client_id in winner_ids else 1,
+                                   won=player.client_id in winner_ids))
+        session.commit()
+
+
+@pytest.mark.asyncio
+async def test_watched_finished_game_keeps_winner_until_viewer_dismisses(setup_status):
+    status, manager, seed, engine = setup_status
+    room = seed(1)
+    initial = await status.snapshot()
+    assert initial['games'][0]['status'] == 'PLAYING'
+    finish_saved_game(engine, room)
+    retained = await status.snapshot(watched_game_ids=[1])
+    assert retained['total'] == 1 and retained['active_total'] == 0 and retained['finished_total'] == 1
+    game = retained['games'][0]
+    assert game['status'] == 'ENDED' and game['winners'] == ['하늘']
+    assert game['turn'] is None and game['deal'] is None and game['players'] == []
+    assert (await status.snapshot(watched_game_ids=[]))['games'] == []
+    # Another viewer still sees the game; dismissal never updates the DB.
+    other_viewer = PublicGameStatus(manager)
+    assert (await other_viewer.snapshot(watched_game_ids=[1]))['games'][0]['winners'] == ['하늘']
+    with Session(engine) as session:
+        assert session.get(Game, 1).status == 'ENDED'
+
+
+@pytest.mark.asyncio
+async def test_rematch_does_not_replace_retained_game_or_use_new_player_state(setup_status):
+    status, _, seed, engine = setup_status
+    room = seed(1)
+    finish_saved_game(engine, room)
+    room.status = 'PLAYING'
+    room.current_game_id = 2
+    room.last_winners = ['다른 게임 우승자']
+    for player in room.players.values():
+        player.nickname = '새 닉네임'
+    with Session(engine) as session:
+        saved = session.get(SavedRoom, room.room_id)
+        saved.status = 'PLAYING'
+        saved.current_game_id = 2
+        session.add(Game(id=2, room_id=room.room_id, status='PLAYING', started_at=datetime(2026, 8, 30, 14)))
+        session.commit()
+    games = (await status.snapshot(watched_game_ids=[1]))['games']
+    assert [(g['id'], g['status']) for g in games] == [(2, 'PLAYING'), (1, 'ENDED')]
+    assert games[1]['winners'] == ['하늘']
+    assert [g['id'] for g in (await status.snapshot(watched_game_ids=[]))['games']] == [2]
+
+
+@pytest.mark.asyncio
+async def test_finished_winners_survive_runtime_loss_and_room_player_cleanup(setup_status):
+    from sqlalchemy import delete
+    status, manager, seed, engine = setup_status
+    room = seed(1)
+    finish_saved_game(engine, room)
+    manager.rooms.clear()
+    with Session(engine) as session:
+        session.execute(delete(RoomPlayer))
+        session.commit()
+    game = (await status.snapshot(watched_game_ids=[1]))['games'][0]
+    assert game['winners'] == ['하늘'] and game['status'] == 'ENDED'
+    assert all(private not in json.dumps(game) for private in ('board', 'marked', 'client_id', 'private-reconnect'))
+
+
+@pytest.mark.asyncio
+async def test_joint_winners_and_ended_pagination(setup_status):
+    status, _, seed, engine = setup_status
+    for number in range(1, 7):
+        room = seed(number)
+        finish_saved_game(engine, room, winner_ids=[p.client_id for p in room.active_players])
+    watched = list(range(1, 7))
+    for size in (1, 2, 4):
+        first = await status.snapshot(page_size=size, watched_game_ids=watched)
+        assert len(first['games']) == size
+        assert first['total'] == 6 and first['finished_total'] == 6
+        assert first['games'][0]['winners'] == ['하늘', '바다']
+    assert [g['id'] for g in (await status.snapshot(page=2, watched_game_ids=watched))['games']] == [2, 1]
+    closed = await status.snapshot(page=2, watched_game_ids=[3, 4, 5, 6])
+    assert closed['page'] == 1 and len(closed['games']) == 4
+
+
+@pytest.mark.asyncio
+async def test_finish_during_snapshot_does_not_produce_empty_card(setup_status):
+    status, manager, seed, engine = setup_status
+    room = seed(1)
+    lock = manager.get_room_lock(room.room_id)
+    await lock.acquire()
+    task = asyncio.create_task(status.snapshot(watched_game_ids=[1]))
+    try:
+        await asyncio.sleep(0)
+        assert not task.done()
+        finish_saved_game(engine, room)
+    finally:
+        lock.release()
+    result = await task
+    assert len(result['games']) == 1
+    assert result['games'][0]['status'] == 'ENDED'
+    assert result['games'][0]['winners'] == ['하늘']
+
+
+@pytest.mark.asyncio
+async def test_websocket_remembers_delivered_game_without_client_refresh(setup_status):
+    status, _, seed, engine = setup_status
+    room = seed(1)
+    router = create_spectator_router(status, Path('.'))
+    endpoint = next(route.endpoint for route in router.routes if route.path == '/api/game-status/ws')
+    class Viewer:
+        def __init__(self):
+            self.sent = []
+        async def accept(self):
+            pass
+        async def receive_text(self):
+            if not self.sent:
+                return json.dumps({'request_id': 1})
+            if len(self.sent) == 1:
+                raise asyncio.TimeoutError()
+            raise WebSocketDisconnect()
+        async def send_json(self, data):
+            self.sent.append(data)
+            if len(self.sent) == 1:
+                finish_saved_game(engine, room)
+    viewer = Viewer()
+    await endpoint(viewer)
+    assert [data['games'][0]['status'] for data in viewer.sent] == ['PLAYING', 'ENDED']
+    assert viewer.sent[1]['games'][0]['winners'] == ['하늘']
+
+
+@pytest.mark.parametrize('ids', ['1', [True], [0], [-1], ['1'], [2147483648]])
+def test_watched_ids_validation(ids):
+    with pytest.raises(ValueError):
+        parse_subscription({'watched_game_ids': ids})

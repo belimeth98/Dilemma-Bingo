@@ -9,16 +9,17 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 
 from database import get_session_factory
-from models import Game, Room, RoomPlayer
+from models import Game, GameResult, Room, RoomPlayer
 
 logger = logging.getLogger(__name__)
 PAGE_SIZES = (1, 2, 4)
 LOG_PAGE_SIZE = 4
 LOG_LIMIT = 200
 GAME_LOG_LIMIT = 256
+MAX_WATCHED_GAMES = 2048
 
 
 def public_player(player, connected: bool, public_id: str) -> dict:
@@ -60,10 +61,14 @@ def parse_subscription(payload: object) -> dict:
         for key, value in log_pages.items()
     ):
         raise ValueError("로그 페이지가 올바르지 않습니다.")
+    watched_game_ids = payload.get("watched_game_ids", [])
+    if (not isinstance(watched_game_ids, list) or len(watched_game_ids) > MAX_WATCHED_GAMES
+            or any(type(value) is not int or not 1 <= value <= 2_147_483_647 for value in watched_game_ids)):
+        raise ValueError("관전 게임 목록이 올바르지 않습니다.")
     request_id = payload.get("request_id", 0)
     if type(request_id) is not int or not 0 <= request_id <= 1_000_000_000:
         raise ValueError("조회 번호가 올바르지 않습니다.")
-    return {"page": page, "page_size": size, "log_pages": log_pages, "request_id": request_id}
+    return {"page": page, "page_size": size, "log_pages": log_pages, "request_id": request_id, "watched_game_ids": list(dict.fromkeys(watched_game_ids))}
 
 
 class PublicGameStatus:
@@ -114,43 +119,82 @@ class PublicGameStatus:
             "total": len(entries),
         }
 
-    async def snapshot(self, page=1, page_size=4, log_pages=None, request_id=0) -> dict:
-        active = (Room.status == "PLAYING", Game.status == "PLAYING")
+    @staticmethod
+    def finished_game(game, winners: list[str]) -> dict:
+        def iso(value):
+            if value is None:
+                return None
+            return value.replace(tzinfo=timezone.utc).isoformat() if value.tzinfo is None else value.isoformat()
+        return {
+            "id": game.id, "room_id": game.room_id, "status": "ENDED",
+            "started_at": iso(game.started_at), "ended_at": iso(game.ended_at),
+            "winners": winners, "players": [], "turn": None, "deal": None,
+            "paused": False, "trade_event_id": 0,
+        }
+
+    async def load_finished_game(self, game_id: int) -> dict | None:
+        # A second committed read covers a game ending/restarting while the
+        # listing query was in flight. Never replace an ended card with a gap.
+        async with get_session_factory()() as session:
+            game = await session.scalar(select(Game).where(Game.id == game_id, Game.status == "ENDED"))
+            if game is None:
+                return None
+            winners = list(await session.scalars(
+                select(GameResult.nickname).where(GameResult.game_id == game_id, GameResult.won.is_(True))
+                .order_by(GameResult.client_id)
+            ))
+            return self.finished_game(game, winners)
+
+    async def snapshot(self, page=1, page_size=4, log_pages=None, request_id=0, watched_game_ids=None) -> dict:
+        watched_game_ids = watched_game_ids or []
+        active = and_(Room.current_game_id == Game.id, Room.status == "PLAYING", Game.status == "PLAYING")
+        retained = and_(Game.status == "ENDED", Game.id.in_(watched_game_ids))
+        visible = or_(active, retained)
         async with get_session_factory()() as session:
             total = await session.scalar(
-                select(func.count()).select_from(Room)
-                .join(Game, Room.current_game_id == Game.id).where(*active)
+                select(func.count()).select_from(Room).join(Game, Game.room_id == Room.room_id).where(visible)
             )
+            finished_total = await session.scalar(select(func.count()).select_from(Game).where(retained))
             total_pages = max(1, (total + page_size - 1) // page_size)
             page = min(page, total_pages)
             records = list((await session.execute(
-                select(Room, Game).join(Game, Room.current_game_id == Game.id)
-                .where(*active).order_by(Game.started_at.desc(), Game.id.desc())
+                select(Room, Game).join(Game, Game.room_id == Room.room_id)
+                .where(visible).order_by(Game.started_at.desc(), Game.id.desc())
                 .offset((page - 1) * page_size).limit(page_size)
             )).all())
-            room_ids = [room.room_id for room, _ in records]
+            room_ids = [room.room_id for room, game in records if game.status == "PLAYING"]
             participants = list(await session.scalars(
                 select(RoomPlayer).where(
                     RoomPlayer.room_id.in_(room_ids), RoomPlayer.left_at.is_(None)
                 ).order_by(RoomPlayer.joined_at, RoomPlayer.client_id)
             )) if room_ids else []
+            ended_ids = [game.id for _, game in records if game.status == "ENDED"]
+            winner_records = list(await session.scalars(
+                select(GameResult).where(GameResult.game_id.in_(ended_ids), GameResult.won.is_(True))
+                .order_by(GameResult.client_id)
+            )) if ended_ids else []
 
         games = []
         for db_room, game in records:
-            saved_players = [p for p in participants if p.room_id == db_room.room_id]
-            # An existing lock protects against reading uncommitted in-memory moves.
-            # Do not create rooms/locks or hydrate persisted state for spectators.
-            lock = self.manager.room_locks.get(db_room.room_id)
-            if lock is not None:
-                async with lock:
-                    item = self.project_game(db_room, game, saved_players)
+            if game.status == "ENDED":
+                item = self.finished_game(game, [winner.nickname for winner in winner_records if winner.game_id == game.id])
             else:
-                item = self.project_game(db_room, game, saved_players)
+                saved_players = [p for p in participants if p.room_id == db_room.room_id]
+                # Existing game lock protects against observing uncommitted moves.
+                lock = self.manager.room_locks.get(db_room.room_id)
+                if lock is not None:
+                    async with lock:
+                        item = self.project_game(db_room, game, saved_players)
+                else:
+                    item = self.project_game(db_room, game, saved_players)
+                if item is None:
+                    item = await self.load_finished_game(game.id)
             if item is not None:
                 item["logs"] = self.game_logs(game.id, (log_pages or {}).get(str(game.id), 1))
                 games.append(item)
         return {
             "type": "game_status", "games": games, "total": total,
+            "active_total": total - finished_total, "finished_total": finished_total,
             "page": page, "page_size": page_size, "total_pages": total_pages, "request_id": request_id,
         }
 
@@ -180,6 +224,7 @@ class PublicGameStatus:
             started = started.replace(tzinfo=timezone.utc)
         return {
             "id": game.id,
+            "status": "PLAYING",
             "room_id": db_room.room_id,
             "started_at": started.isoformat(),
             "players": players,
@@ -220,7 +265,7 @@ def create_spectator_router(status: PublicGameStatus, base_dir: Path) -> APIRout
             while True:
                 try:
                     raw = await asyncio.wait_for(websocket.receive_text(), timeout=1.0)
-                    if len(raw) > 4096:
+                    if len(raw) > 65536:
                         await websocket.close(code=1009)
                         return
                     subscription = parse_subscription(json.loads(raw))
@@ -233,6 +278,11 @@ def create_spectator_router(status: PublicGameStatus, base_dir: Path) -> APIRout
                 try:
                     result = await status.snapshot(**subscription)
                     subscription["page"] = result["page"]
+                    # Remember delivered games without waiting for another client
+                    # request; a quick finish between refreshes must stay visible.
+                    subscription["watched_game_ids"] = list(dict.fromkeys(
+                        subscription["watched_game_ids"] + [game["id"] for game in result["games"]]
+                    ))
                 except Exception as error:
                     logger.warning("Game status unavailable (%s)", type(error).__name__)
                     result = {"type": "error", "message": "현황을 불러오지 못했습니다. 자동으로 다시 시도합니다."}
